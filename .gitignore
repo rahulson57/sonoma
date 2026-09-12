@@ -1,0 +1,26 @@
+# OS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# Dependencies & build output (committing these breaks Nexus landings)
+node_modules/
+.env
+.env.local
+*.log
+
+# Toolchain output (titan incident: every slice generates these, but the .gitignore was owned by
+# a LATE slice — so no early slice was allowed to ignore its own output, and an untracked-file
+# sweep raced a dev server mid-write. Generic, framework-safe entries only; project-specific
+# rules (data dirs, upload stores) belong to the slice that owns the file.)
+dist/
+build/
+coverage/
+.next/
+.cache/
+test-results/
+playwright-report/
+*.tsbuildinfo
