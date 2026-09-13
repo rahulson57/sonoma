@@ -166,7 +166,7 @@ describe('scanBytes — window handover', { timeout: 30_000 }, () => {
   it.each([
     ['NAME=value with spaces', `DB_PASSWORD=correct horse ${pw} staple`, `correct horse ${pw} staple`],
     ['export NAME=value;rest', `export SERVICE_API_TOKEN=${pw};rest-of-token`, `${pw};rest-of-token`],
-    ['scheme://user:password@host', ['postgres', '://', 'app_user', ':', pw, '@', 'db.internal.invalid:5432/app'].join(''), pw],
+    ['credentialed URL (scheme, user, password, host)', ['postgres', '://', 'app_user', ':', pw, '@', 'db.internal.invalid:5432/app'].join(''), pw],
     ['"name": "escaped \\" value"', `{"client_secret": "ab\\"${pw}"}`, `ab\\"${pw}`],
   ])('a %s secret is reported identically wherever a window boundary falls in it', (_name, line, secret) => {
     expect(sweep(line, secret, 1)).toEqual([]);
