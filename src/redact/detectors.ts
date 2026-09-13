@@ -97,7 +97,8 @@ const DETECTORS: readonly Detector[] = [
   },
   {
     kind: 'db_url',
-    // scheme://user:password@host (any scheme; user may be empty). Only the password is redacted,
+    // A URL carrying credentials: scheme, "://", optional user, ":", password, "@", host (any
+    // scheme). Only the password is redacted,
     // so the host and database stay readable.
     pattern: /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,30}:\/\/[^\s:/?#@'"<>]*:([^\s@'"<>]+)@/dg,
     select: firstGroup([1]),
