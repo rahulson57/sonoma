@@ -53,7 +53,10 @@ describe('bench results shape', () => {
   });
 
   it.runIf(existsSync(LOCAL_RESULTS))('every scenario entry in the local results.json has all 7 phase timings', () => {
-    expectAllPhaseTimings(JSON.parse(readFileSync(LOCAL_RESULTS, 'utf8')) as BenchReport);
+    // `npm run bench` writes a report even when no scenario bench exists yet (zero entries), so
+    // only the per-entry shape is required here — validateReportShape checks all 7 phases on each.
+    const report = JSON.parse(readFileSync(LOCAL_RESULTS, 'utf8')) as BenchReport;
+    expect(validateReportShape(report)).toEqual([]);
   });
 
   it('rejects entries with a missing phase, a non-numeric timing, or no phases at all', () => {
