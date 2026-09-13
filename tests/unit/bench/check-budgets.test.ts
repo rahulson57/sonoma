@@ -2,8 +2,6 @@
  * SPEC-002: `tsx bench/check-budgets.ts --results <file>` exits non-zero and names the scenario for
  * the over-budget fixture, and exits 0 for the within-budget fixture. The CLI tests run the real
  * script through tsx, as `npm run bench:check` does.
- * SPEC-002 places this file under tests/unit/bench/. It lives here because TASK-001's file scope is
- * tests/unit/harness/** (see the TASK-001 challenge on SPEC-002).
  */
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';

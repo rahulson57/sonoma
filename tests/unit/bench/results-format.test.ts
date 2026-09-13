@@ -9,8 +9,6 @@
  *   plumbing bench in the OS temp dir. It proves bench/phases.ts gets the BenchResult fields into
  *   vitest's report. That bench records constant numbers and times nothing, so it is not a
  *   performance measurement, and it never lands under bench/scenarios/.
- * SPEC-002 places this file under tests/unit/bench/. It lives here because TASK-001's file scope is
- * tests/unit/harness/** (see the TASK-001 challenge on SPEC-002).
  */
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
