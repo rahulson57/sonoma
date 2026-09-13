@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/common.schema.json",
+  "title": "ckpt shared definitions",
+  "description": "Identifier, hash and reference shapes shared by the SPEC-004 canonical model schemas. Referenced by $ref; not a document type on its own.",
+  "$defs": {
+    "RunId": {
+      "description": "run_<ulid> (Crockford base32, canonical upper case).",
+      "type": "string",
+      "pattern": "^run_[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "CheckpointId": {
+      "description": "c_<n>, monotonic per run, starting at 1.",
+      "type": "string",
+      "pattern": "^c_[1-9][0-9]*$"
+    },
+    "Sha256": {
+      "description": "Lowercase hex sha256 digest.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "GitSha": {
+      "description": "Lowercase hex git object id (sha1, or sha256 repositories).",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "Timestamp": {
+      "description": "UTC ISO-8601 timestamp, as produced by Date#toISOString.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+    },
+    "BlobRef": {
+      "description": "Reference to an immutable content-addressed blob: sha256 of its bytes and its byte length.",
+      "type": "object",
+      "required": ["sha256", "size"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": { "$ref": "#/$defs/Sha256" },
+        "size": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "TokenUsage": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

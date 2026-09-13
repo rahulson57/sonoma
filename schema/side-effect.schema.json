@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/side-effect.schema.json",
+  "title": "SideEffect",
+  "description": "SPEC-004 external side effect: recorded, never undone. reversibility defaults to irreversible when not given explicitly (applied by createSideEffect / validateSideEffect).",
+  "type": "object",
+  "required": ["type", "target", "request_hash", "response_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "type": { "type": "string", "minLength": 1 },
+    "target": { "type": "string", "minLength": 1 },
+    "request_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "response_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "reversibility": { "enum": ["reversible", "compensatable", "irreversible"], "default": "irreversible" }
+  }
+}

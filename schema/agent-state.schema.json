@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/agent-state.schema.json",
+  "title": "AgentStateObject",
+  "description": "SPEC-004 deterministic Agent State Object, stored as the checkpoint's state_blob. Deterministic fields only: semantic claims live in SemanticProjections, never here, so no claim can overwrite a deterministic field. Minimal v1 shape; extending it is a schemaVersion change.",
+  "type": "object",
+  "required": ["schemaVersion", "run_id", "checkpoint_id", "ledger_seq", "workspace_commit", "pending_intent", "usage"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "run_id": { "$ref": "common.schema.json#/$defs/RunId" },
+    "checkpoint_id": { "$ref": "common.schema.json#/$defs/CheckpointId" },
+    "ledger_seq": { "type": "integer", "minimum": 0 },
+    "workspace_commit": { "$ref": "common.schema.json#/$defs/GitSha" },
+    "pending_intent": { "type": "array", "items": { "$ref": "#/$defs/PendingIntent" } },
+    "usage": { "$ref": "common.schema.json#/$defs/TokenUsage" }
+  },
+  "$defs": {
+    "PendingIntent": {
+      "description": "Derived from ledger acknowledgements: completed only with tool.completed / side_effect.committed; an unacknowledged request is in_progress; a tool.failed request is pending.",
+      "type": "object",
+      "required": ["kind", "intent_id", "request_event_id", "status", "requested_seq", "resolved_seq"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["tool", "side_effect"] },
+        "intent_id": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "request_event_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["completed", "in_progress", "pending"] },
+        "requested_seq": { "type": "integer", "minimum": 1 },
+        "resolved_seq": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] }
+      }
+    }
+  }
+}

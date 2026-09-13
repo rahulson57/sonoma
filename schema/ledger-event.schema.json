@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/ledger-event.schema.json",
+  "title": "LedgerEvent",
+  "description": "SPEC-004 append-only, hash-chained Execution Ledger event. hash = sha256(prev_hash || canonicalJSON(event without hash)); the first event of a run chains from 64 zero hex digits. Exactly one of payload (inline JSON, <= 1 MiB canonical UTF-8) or payload_ref (CAS blob holding the canonical JSON bytes) is non-null. Payloads are open objects so a new adapter needs no schema change.",
+  "type": "object",
+  "required": ["event_id", "run_id", "seq", "ts", "type", "actor", "payload", "payload_ref", "prev_hash", "hash"],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "run_id": { "$ref": "common.schema.json#/$defs/RunId" },
+    "seq": {
+      "description": "Strictly increasing and contiguous per run, starting at 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "ts": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "type": {
+      "enum": [
+        "run.created",
+        "agent.started",
+        "context.built",
+        "model.requested",
+        "model.responded",
+        "tool.requested",
+        "tool.completed",
+        "tool.failed",
+        "workspace.changed",
+        "workspace.file_skipped",
+        "side_effect.requested",
+        "side_effect.committed",
+        "checkpoint.created",
+        "agent.interrupted",
+        "agent.resumed",
+        "agent.forked",
+        "agent.rolled_back",
+        "distill.completed",
+        "export.unsafe"
+      ]
+    },
+    "actor": { "enum": ["agent", "runtime", "human"] },
+    "payload": { "type": ["object", "null"] },
+    "payload_ref": {
+      "anyOf": [{ "$ref": "common.schema.json#/$defs/BlobRef" }, { "type": "null" }]
+    },
+    "prev_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "hash": { "$ref": "common.schema.json#/$defs/Sha256" }
+  },
+  "anyOf": [
+    {
+      "description": "Inline payload.",
+      "properties": { "payload": { "type": "object" }, "payload_ref": { "type": "null" } }
+    },
+    {
+      "description": "Payload over 1 MiB, stored as a blob.",
+      "properties": {
+        "payload": { "type": "null" },
+        "payload_ref": { "type": "object", "properties": { "size": { "minimum": 1048577 } } }
+      }
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "id": "proj_01J8Z3K5QW7XV2M9N4P6R8T0AC",
+  "checkpointId": "c_2",
+  "distiller": {
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "promptVersion": "distill-v1"
+  },
+  "input": {
+    "stateHash": "cd19da5994224141801f277fdfc08871c5d7fdcece49962f9a4b99683b96af10",
+    "ledgerRange": [
+      4,
+      9
+    ],
+    "workspaceCommit": "87b805cfcd7f422dc6c23c57179d7c0929d3147d"
+  },
+  "claims": [
+    {
+      "field": "next_action",
+      "value": "Run the ledger unit tests",
+      "origin": "distilled",
+      "confidence": 0.8,
+      "provenance": {
+        "event_ids": [
+          "evt_0002"
+        ],
+        "artifact_refs": [],
+        "workspace_paths": [
+          "src/ledger/ledger.ts"
+        ],
+        "checkpoint_ids": [
+          "c_1"
+        ]
+      }
+    },
+    {
+      "field": "decision",
+      "value": "Offload payloads over 1 MiB to CAS",
+      "origin": "distilled",
+      "provenance": {
+        "event_ids": [
+          "evt_0002"
+        ],
+        "artifact_refs": [],
+        "workspace_paths": [],
+        "checkpoint_ids": []
+      }
+    }
+  ],
+  "usage": {
+    "inputTokens": 1840,
+    "outputTokens": 212,
+    "costUsd": 0.0026
+  },
+  "createdAt": "2026-09-13T12:04:00.000Z"
+}

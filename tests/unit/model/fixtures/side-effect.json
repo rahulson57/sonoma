@@ -1,0 +1,7 @@
+{
+  "type": "http.request",
+  "target": "POST https://api.example.com/v1/deploy",
+  "request_hash": "d30b097bfae3d51a34c5d09ba85f667cccff0b7921141a2db1cc2ce270738f64",
+  "response_hash": "ebba8a5f215794bf3e0bad1e568c0146c24600e359797bf271fdc954e5da05ce",
+  "reversibility": "compensatable"
+}
