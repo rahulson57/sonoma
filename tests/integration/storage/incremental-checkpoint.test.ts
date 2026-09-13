@@ -3,6 +3,7 @@
  * tree and reads only the written files from stagingDir. A delta that does not fit fails with
  * ERR_INVALID_CHANGES and writes nothing.
  */
+import { createHash } from 'node:crypto';
 import { chmod, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -37,6 +38,23 @@ async function treeOf(repoDir: string, commit: string): Promise<string> {
 
 async function parentOf(repoDir: string, commit: string): Promise<string> {
   return (await git(repoDir, ['rev-parse', `${commit}^`])).trim();
+}
+
+/** Everything a rejected createCheckpoint must leave untouched: index rows, events, refs, git objects and CAS. */
+async function noWriteSnapshot(backend: LocalBackend, repoDir: string, runId: string) {
+  return {
+    checkpoints: await backend.listCheckpoints(runId),
+    events: await backend.getEvents(runId, { fromSeq: 1, toSeq: 1000 }),
+    refs: await git(repoDir, ['for-each-ref', 'refs/checkpoints/']),
+    gitObjects: await git(repoDir, ['count-objects', '-v']),
+    store: (await walkTree(path.join(repoDir, '.ckpt', 'objects'))).map((entry) => entry.rel).sort(),
+  };
+}
+
+/** The git blob id of `content`, without writing it. */
+function blobId(content: string): string {
+  const bytes = Buffer.from(content, 'utf8');
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 }
 
 /** The tree of a full build of `stagingDir` (no parent, no delta, no ref). */
@@ -151,13 +169,7 @@ describe('incremental createCheckpoint', () => {
       const run = await backend.createRun({ agent: 'claude-code' });
       const first = await checkpoint(backend, staging.dir, { run_id: run.run_id, parent_checkpoint_id: null });
 
-      const snapshot = async () => ({
-        checkpoints: await backend.listCheckpoints(run.run_id),
-        events: await backend.getEvents(run.run_id, { fromSeq: 1, toSeq: 1000 }),
-        refs: await git(repo.dir, ['for-each-ref', 'refs/checkpoints/']),
-        gitObjects: await git(repo.dir, ['count-objects', '-v']),
-        store: (await walkTree(path.join(repo.dir, '.ckpt', 'objects'))).map((entry) => entry.rel).sort(),
-      });
+      const snapshot = () => noWriteSnapshot(backend, repo.dir, run.run_id);
       const before = await snapshot();
 
       await writeFile(path.join(staging.dir, 'src/a.ts'), 'export const a = 2;\n');
@@ -173,6 +185,7 @@ describe('incremental createCheckpoint', () => {
         ['a path escaping the root', { written: ['../outside.txt'], deleted: [] }],
         ['a non-canonical path', { written: ['src//a.ts'], deleted: [] }],
         ['a .git path', { written: ['.git/config'], deleted: [] }],
+        ['a case variant of .git', { written: ['src/a.ts', '.GIT/config'], deleted: [] }],
         ['a malformed delta', { written: 'src/a.ts', deleted: [] } as unknown as WorkspaceChanges],
       ];
       for (const [name, changes] of bad) {
@@ -220,6 +233,62 @@ describe('incremental createCheckpoint', () => {
       await scratch.cleanup();
       await staging.cleanup();
       await parentStaging.cleanup();
+      await repo.cleanup();
+    }
+  });
+
+  it('rejects a written path that goes through a symlinked directory, so bytes from outside stagingDir never reach a commit', async () => {
+    const repo = await tmpGitRepo();
+    const staging = await makeTempDir('ckpt-incr-');
+    const outside = await makeTempDir('ckpt-outside-');
+    const { backend, clock } = await openBackend(repo.dir);
+    const SECRET = 'OUTSIDE-STAGING-UNSANITIZED\n';
+    const DEEP_SECRET = 'OUTSIDE-STAGING-DEEPER\n';
+    const expectRejected = async (runId: string, parentId: string, changes: WorkspaceChanges) => {
+      const before = await noWriteSnapshot(backend, repo.dir, runId);
+      await expect(
+        checkpoint(backend, staging.dir, { run_id: runId, parent_checkpoint_id: parentId, changes }),
+        JSON.stringify(changes),
+      ).rejects.toMatchObject({ code: 'ERR_INVALID_CHANGES' });
+      expect(await noWriteSnapshot(backend, repo.dir, runId), JSON.stringify(changes)).toEqual(before);
+    };
+    try {
+      await writeFiles(outside.dir, { 'secret.txt': SECRET, 'deeper/s2.txt': DEEP_SECRET });
+      await writeFiles(staging.dir, { 'f.txt': 'f\n', 'real/r.txt': 'r\n' });
+      const run = await backend.createRun({ agent: 'claude-code' });
+      const first = await checkpoint(backend, staging.dir, { run_id: run.run_id, parent_checkpoint_id: null });
+
+      // Repro 1: the parent has no `lnk`; stagingDir/lnk (and real/lnk) point outside stagingDir.
+      await symlink(outside.dir, path.join(staging.dir, 'lnk'));
+      await symlink(outside.dir, path.join(staging.dir, 'real', 'lnk'));
+      clock.tick(1000);
+      await expectRejected(run.run_id, first.checkpoint_id, { written: ['lnk/secret.txt'], deleted: [] });
+      await expectRejected(run.run_id, first.checkpoint_id, { written: ['f.txt', 'real/lnk/deeper/s2.txt'], deleted: [] });
+
+      // The links themselves are fine to commit: as 120000 entries holding their target, like a full build.
+      const second = await checkpoint(backend, staging.dir, {
+        run_id: run.run_id,
+        parent_checkpoint_id: first.checkpoint_id,
+        changes: { written: ['lnk', 'real/lnk'], deleted: [] },
+      });
+      expect(await treeOf(repo.dir, second.workspace_commit)).toBe(await fullBuildTree(repo.dir, staging.dir));
+      expect((await treeFiles(repo.dir, second.workspace_commit)).get('lnk')?.mode).toBe('120000');
+
+      // Repro 2: the parent already holds `lnk` as a symlink, the delta deletes it and writes through it,
+      // and `lnk` is still a symlink on disk.
+      clock.tick(1000);
+      await expectRejected(run.run_id, second.checkpoint_id, { written: ['lnk/secret.txt'], deleted: ['lnk'] });
+      await expectRejected(run.run_id, second.checkpoint_id, { written: ['real/lnk/secret.txt'], deleted: ['real/lnk'] });
+
+      // Neither outside file ever became a git object.
+      for (const content of [SECRET, DEEP_SECRET]) {
+        await expect(git(repo.dir, ['cat-file', '-e', blobId(content)])).rejects.toThrow();
+      }
+      expect((await backend.listCheckpoints(run.run_id)).map((cp) => cp.checkpoint_id)).toEqual(['c_1', 'c_2']);
+    } finally {
+      await backend.close();
+      await outside.cleanup();
+      await staging.cleanup();
       await repo.cleanup();
     }
   });

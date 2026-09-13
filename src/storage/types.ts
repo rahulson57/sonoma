@@ -67,8 +67,12 @@ export interface NewCheckpoint {
    * read. When there is none, `changes` is ignored and stagingDir is committed in full.
    *
    * A delta that does not fit fails with ERR_INVALID_CHANGES, and nothing is written. That covers a
-   * `written` path missing from stagingDir, a `deleted` path that is not a file of the parent tree, a
-   * path in both lists, and a file/directory clash with an entry the delta does not remove.
+   * `written` path missing from stagingDir, a `written` path that goes through a symlink (or any other
+   * non-directory) in stagingDir, so it could not read bytes from outside the sanitized tree, a `deleted`
+   * path that is not a file of the parent tree, a path in both lists, a path with a `.git` segment in any
+   * letter case, and a file/directory clash with an entry the delta does not remove. A path git itself
+   * refuses to index is never dropped silently: the checkpoint fails (ERR_INVALID_CHANGES here, and
+   * ERR_INVALID_INPUT for a full build).
    */
   readonly changes?: WorkspaceChanges;
 }

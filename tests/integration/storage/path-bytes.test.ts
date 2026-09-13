@@ -72,6 +72,58 @@ describe('checkpoint commits store staged bytes under their exact paths', () => 
     }
   });
 
+  it('a staged path git refuses fails the checkpoint instead of being silently dropped', async () => {
+    const repo = await tmpGitRepo();
+    const staging = await makeTempDir('ckpt-paths-');
+    const { backend, clock } = await openBackend(repo.dir);
+    // git's verify_path refuses ".git" in any case everywhere, and with core.protectHFS also ".git" spelled
+    // with HFS-ignorable code points. update-index only prints "Ignoring path" for such an entry and exits 0.
+    const hfsDotGit = '.g\u200cit/config'; // ZERO WIDTH NON-JOINER inside ".git"
+    try {
+      await git(repo.dir, ['config', 'core.protectHFS', 'true']);
+      const run = await backend.createRun({ agent: 'claude-code' });
+      const committed = async () => ({
+        checkpoints: await backend.listCheckpoints(run.run_id),
+        refs: await git(repo.dir, ['for-each-ref', 'refs/checkpoints/']),
+      });
+      // Full builds: a case variant of .git is refused before hashing; the HFS spelling by git itself.
+      for (const refused of ['.GIT/config', 'sub/.Git/HEAD', hfsDotGit]) {
+        await expect(
+          checkpointFiles(backend, { run_id: run.run_id, parent_checkpoint_id: null }, { [refused]: 'NOT COMMITTED', 'ok.txt': 'ok' }),
+          JSON.stringify(refused),
+        ).rejects.toMatchObject({ code: 'ERR_INVALID_INPUT' });
+      }
+      expect(await committed()).toEqual({ checkpoints: [], refs: '' });
+
+      await writeFiles(staging.dir, { 'ok.txt': 'ok' });
+      const first = await backend.createCheckpoint({ run_id: run.run_id, parent_checkpoint_id: null, pending_intent: [], usage: NO_USAGE, stagingDir: staging.dir });
+      await expectCommitted(repo.dir, first.workspace_commit, { 'ok.txt': 'ok' });
+      const before = await committed();
+
+      // Incremental builds fail the same paths with ERR_INVALID_CHANGES.
+      await writeFiles(staging.dir, { '.GIT/config': 'NOT COMMITTED', [hfsDotGit]: 'NOT COMMITTED' });
+      clock.tick(1000);
+      for (const refused of ['.GIT/config', hfsDotGit]) {
+        await expect(
+          backend.createCheckpoint({
+            run_id: run.run_id,
+            parent_checkpoint_id: first.checkpoint_id,
+            pending_intent: [],
+            usage: NO_USAGE,
+            stagingDir: staging.dir,
+            changes: { written: ['ok.txt', refused], deleted: [] },
+          }),
+          JSON.stringify(refused),
+        ).rejects.toMatchObject({ code: 'ERR_INVALID_CHANGES' });
+      }
+      expect(await committed()).toEqual(before);
+    } finally {
+      await backend.close();
+      await staging.cleanup();
+      await repo.cleanup();
+    }
+  });
+
   it('a staging tree holding only "only" checkpoints its bytes', async () => {
     const repo = await tmpGitRepo();
     const { backend } = await openBackend(repo.dir);

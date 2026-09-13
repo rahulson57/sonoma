@@ -69,6 +69,9 @@ function invalidChanges(message: string): StorageError {
   return new StorageError('ERR_INVALID_CHANGES', message);
 }
 
+/** The stderr line prefix `update-index --index-info` prints (untranslated) for an entry it skips. */
+const IGNORING_PATH = 'Ignoring path ';
+
 /** A `--stdin-paths` line git reads back verbatim: printable ASCII that does not start with `"`. */
 const VERBATIM_STDIN_PATH = /^[\x20\x21\x23-\x7e][\x20-\x7e]*$/;
 
@@ -89,6 +92,9 @@ export function quoteStdinPath(p: string): string {
   return `${out}"`;
 }
 
+/** `.git` in any ASCII letter case. git's verify_path refuses such a path segment on every platform. */
+const DOT_GIT_ANY_CASE = /^\.git$/i;
+
 /** Why `p` is not a canonical repo-relative POSIX path a checkpoint tree can hold, or null if it is. */
 export function repoPathProblem(p: unknown): string | null {
   if (typeof p !== 'string' || p === '') return 'is not a non-empty string';
@@ -97,7 +103,8 @@ export function repoPathProblem(p: unknown): string | null {
   for (const segment of p.split('/')) {
     if (segment === '') return 'is not a canonical relative path (leading, trailing or doubled "/")';
     if (segment === '.' || segment === '..') return 'contains a "." or ".." segment';
-    if (segment === '.git') return 'contains a ".git" segment';
+    // git refuses ".git" in any letter case (and silently drops such an entry from an index), so reject it here.
+    if (DOT_GIT_ANY_CASE.test(segment)) return 'contains a ".git" segment (in any letter case)';
   }
   return null;
 }
@@ -170,6 +177,10 @@ export async function collectStagingTree(root: string): Promise<StagedEntry[]> {
     for (const name of await readdir(dir)) {
       if (name === '.git') continue;
       const rel = prefix === '' ? name : `${prefix}/${name}`;
+      if (DOT_GIT_ANY_CASE.test(name)) {
+        // git would drop every entry under it from the index without failing, so refuse rather than omit.
+        throw new StorageError('ERR_INVALID_INPUT', `staging tree holds ${JSON.stringify(rel)}, a case variant of ".git" that git refuses to commit`);
+      }
       const abs = path.join(dir, name);
       let st;
       try {
@@ -256,6 +267,7 @@ export class GitRepo {
 
       let records: string[];
       let hashed: number;
+      const incremental = options.parent !== null && options.changes !== undefined;
       if (options.parent !== null && options.changes !== undefined) {
         ({ records, hashed } = await this.#deltaRecords(stagingDir, options.parent, options.changes, env, work));
       } else {
@@ -266,7 +278,18 @@ export class GitRepo {
         hashed = entries.length;
       }
       if (records.length > 0) {
-        await this.#ok(['update-index', '--add', '-z', '--index-info'], { cwd: work, env, input: records.join('') });
+        const result = await this.#run(['update-index', '--add', '-z', '--index-info'], { cwd: work, env, input: records.join('') });
+        if (result.code !== 0) {
+          throw new StorageError('ERR_GIT', `git update-index failed (exit ${result.code}): ${result.stderr.trim()}`);
+        }
+        // For a path its verify_path refuses (e.g. ".git" spelled with HFS-ignorable code points under
+        // core.protectHFS), update-index prints "Ignoring path <path>", leaves the entry out and exits 0.
+        // A staged path must never be dropped silently, so the checkpoint fails instead.
+        const ignored = result.stderr.split('\n').filter((line) => line.startsWith(IGNORING_PATH));
+        if (ignored.length > 0) {
+          const paths = ignored.map((line) => JSON.stringify(line.slice(IGNORING_PATH.length))).join(', ');
+          throw new StorageError(incremental ? 'ERR_INVALID_CHANGES' : 'ERR_INVALID_INPUT', `git refuses to commit staged path(s): ${paths}`);
+        }
       }
 
       const tree = (await this.#ok(['write-tree'], { env })).trim();
@@ -308,6 +331,26 @@ export class GitRepo {
       if (deleted.has(p)) throw invalidChanges(`${JSON.stringify(p)} is both written and deleted`);
     }
 
+    // lstat follows symlinks in every component but the last, and so does hash-object. So every directory a
+    // written path goes through must be a real directory of stagingDir, or bytes from outside the sanitized
+    // staging tree could reach the commit (SPEC-003). Shallower directories first, so the message names the
+    // link itself. Only the written paths' own directories are checked; unchanged files stay unread.
+    const writtenDirs = new Set<string>();
+    for (const p of written) for (const dir of parentDirs(p)) writtenDirs.add(dir);
+    for (const dir of [...writtenDirs].sort((a, b) => a.length - b.length)) {
+      let st;
+      try {
+        st = await lstat(path.join(stagingDir, dir));
+      } catch (err) {
+        const code = errnoCode(err);
+        if (code === 'ENOENT' || code === 'ENOTDIR') throw invalidChanges(`written directory ${JSON.stringify(dir)} is not in stagingDir`);
+        throw err;
+      }
+      if (!st.isDirectory()) {
+        throw invalidChanges(`written paths go through ${JSON.stringify(dir)}, which is a ${st.isSymbolicLink() ? 'symlink' : 'non-directory'} in stagingDir`);
+      }
+    }
+
     const additions: StagedEntry[] = [];
     for (const p of written) {
       let st;
@@ -334,8 +377,6 @@ export class GitRepo {
     // update-index silently drops an entry that a new entry displaces (a file where a directory was, or
     // the reverse), so the delta must account for every entry it displaces.
     const remains = (p: string): boolean => written.has(p) || (inParent.has(p) && !deleted.has(p));
-    const writtenDirs = new Set<string>();
-    for (const p of written) for (const dir of parentDirs(p)) writtenDirs.add(dir);
     for (const p of written) {
       for (const dir of parentDirs(p)) {
         if (remains(dir)) throw invalidChanges(`written path ${JSON.stringify(p)} is inside ${JSON.stringify(dir)}, which remains a file`);
