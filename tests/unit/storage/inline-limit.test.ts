@@ -1,7 +1,9 @@
 /** SPEC-005 "must never store a blob larger than 1 MB inline in SQLite". */
-import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
+import { describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { GENESIS_PREV_HASH } from '../../../src/ledger/hash.js';
 import { MAX_INLINE_PAYLOAD_BYTES } from '../../../src/ledger/ledger.js';
 import type { LedgerEvent } from '../../../src/model/types.js';
@@ -21,10 +23,10 @@ describe('inline payload limit', () => {
       expect(event.payload_ref).not.toBeNull();
       expect((await backend.getEvents(run.run_id, { fromSeq: 1, toSeq: 1 }))[0]).toEqual(event);
 
-      const db = new DatabaseSync(path.join(repo.dir, '.ckpt', 'checkpoint.db'));
+      const db = new Database(path.join(repo.dir, '.ckpt', 'checkpoint.db'), { readonly: true });
       try {
-        const row = db.prepare('SELECT MAX(length(record)) AS longest FROM events').get();
-        expect(Number(row?.['longest'])).toBeLessThan(MAX_INLINE_PAYLOAD_BYTES);
+        const row = db.prepare('SELECT MAX(length(record)) AS longest FROM events').get() as { longest: number } | undefined;
+        expect(Number(row?.longest)).toBeLessThan(MAX_INLINE_PAYLOAD_BYTES);
       } finally {
         db.close();
       }

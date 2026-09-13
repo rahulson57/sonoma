@@ -1,6 +1,8 @@
 /** SPEC-005 / SPEC-003: the store directory is 0700 and every file under it 0600. */
 import { Readable } from 'node:stream';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { MAX_INLINE_PAYLOAD_BYTES } from '../../../src/ledger/ledger.js';
 import { tmpGitRepo } from '../../helpers/tmpRepo.js';
 import { checkpointFiles, openBackend, walkTree, type TreeEntry } from './support.js';

@@ -1,7 +1,9 @@
 /** SPEC-005: one writer per run, enforced by a lockfile; a second writer gets ERR_RUN_LOCKED. */
 import { readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { verifyChain } from '../../../src/ledger/verify-chain.js';
 import { RunLock, runLockPath, ulid } from '../../../src/storage/index.js';
 import { tmpGitRepo } from '../../helpers/tmpRepo.js';

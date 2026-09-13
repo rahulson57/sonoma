@@ -3,7 +3,7 @@
  *
  * A checkpoint commit is built from a caller-sanitized staging directory without touching the user's
  * branches, index or worktree:
- *   1. a temporary index file (GIT_INDEX_FILE) under `.ckpt/tmp`, started empty (`read-tree --empty`);
+ *   1. a temporary index file (GIT_INDEX_FILE) under `.ckpt/tmp` that does not exist yet (an empty index);
  *   2. file blobs written with `hash-object -w --no-filters --stdin-paths` (no clean/smudge filters,
  *      attributes, ignore rules or LFS run on the staged bytes), symlinks hashed from their target;
  *   3. entries added with `update-index -z --index-info`, then `write-tree` and `commit-tree`;
@@ -129,8 +129,9 @@ export class GitRepo {
     const entries = await collectStagingTree(stagingDir);
     const work = await mkdtemp(path.join(options.tmpDir, 'index-'));
     try {
+      // A fresh, not-yet-existing index file is an empty index: update-index creates it and
+      // write-tree of a missing index yields the empty tree, so no `read-tree --empty` spawn is needed.
       const env = { GIT_INDEX_FILE: path.join(work, 'index') };
-      await this.#ok(['read-tree', '--empty'], { env });
 
       const records: string[] = [];
       const files = entries.filter((entry) => entry.kind !== 'symlink');

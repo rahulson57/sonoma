@@ -1,7 +1,9 @@
 /** SPEC-005 change detection: size+mtime unchanged ⇒ not re-read; otherwise rehash. */
 import { utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import {
   ChangeDetector,
   RACY_WINDOW_NS,

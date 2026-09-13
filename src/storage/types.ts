@@ -59,7 +59,14 @@ export interface StorageBackend {
   /** sha256, dedup */
   putBlob(data: Uint8Array | Readable): Promise<BlobRef>;
   getBlob(ref: BlobRef): Promise<Readable>;
-  /** single writer per run */
+  /**
+   * Single writer per run. Durably writes the checkpoint as ONE atomic unit, in visibility order:
+   * state blob (CAS) → git ref → `checkpoint.created` ledger event → index row.
+   *
+   * Storage seals and appends `checkpoint.created` itself, through S03's ExecutionLedger, and the
+   * returned Checkpoint's `ledger_seq` is that event's seq (DEC-018). Callers, including the Checkpoint
+   * Engine, MUST NOT append a second `checkpoint.created`; `appendEvent` rejects that type.
+   */
   createCheckpoint(cp: NewCheckpoint): Promise<Checkpoint>;
   getCheckpoint(id: CheckpointRef): Promise<Checkpoint>;
   listCheckpoints(runId: string): Promise<Checkpoint[]>;

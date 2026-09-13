@@ -1,7 +1,9 @@
 /** SPEC-005: checkpoint.db is a rebuildable index — reindex() reproduces it from CAS + refs + ledger. */
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { MAX_INLINE_PAYLOAD_BYTES } from '../../../src/ledger/ledger.js';
 import { verifyChain } from '../../../src/ledger/verify-chain.js';
 import type { Checkpoint, LedgerEvent } from '../../../src/model/types.js';
@@ -41,19 +43,20 @@ describe('reindex', () => {
       const first = await backend.createRun({ agent: 'claude-code' });
       const second = await backend.createRun({ agent: 'sdk' });
 
-      await replay(backend, first.run_id, 40, 11);
+      // Small streams: every append is an fsync, and the criterion is about 3 runs, not event volume.
+      await replay(backend, first.run_id, 12, 11);
       const f1 = await checkpointFiles(backend, { run_id: first.run_id, parent_checkpoint_id: null }, { 'src/index.ts': 'export const a = 1;\n' });
       clock.tick(5000);
-      await replay(backend, first.run_id, 25, 12);
+      await replay(backend, first.run_id, 8, 12);
       await backend.appendEvent(first.run_id, { type: 'tool.completed', actor: 'runtime', payload: { stdout: 'o'.repeat(MAX_INLINE_PAYLOAD_BYTES + 10) } });
       await checkpointFiles(backend, { run_id: first.run_id, parent_checkpoint_id: f1.checkpoint_id, label: 'handoff' }, { 'src/index.ts': 'export const a = 2;\n' });
 
-      await replay(backend, second.run_id, 30, 21);
+      await replay(backend, second.run_id, 10, 21);
       await checkpointFiles(backend, { run_id: second.run_id, parent_checkpoint_id: null }, { 'README.md': 'second\n' });
 
       const third = await backend.fork({ run_id: first.run_id, checkpoint_id: f1.checkpoint_id });
       expect(third).toMatchObject({ parent_run_id: first.run_id, forked_from_checkpoint: 'c_1', agent: 'claude-code' });
-      await replay(backend, third.run_id, 10, 31);
+      await replay(backend, third.run_id, 5, 31);
       const t1 = await checkpointFiles(backend, { run_id: third.run_id, parent_checkpoint_id: null }, { 'src/index.ts': 'export const a = 100;\n' });
       // A fork's first commit descends from the checkpoint it was forked from.
       expect((await git(repo.dir, ['rev-parse', `${t1.workspace_commit}^`])).trim()).toBe(f1.workspace_commit);

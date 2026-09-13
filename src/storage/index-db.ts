@@ -6,12 +6,14 @@
  * the file can be deleted at any time. WAL journal mode; the database file is created 0600 before
  * SQLite opens it, and SQLite creates its -wal/-shm files with the database file's permissions.
  *
+ * Driver: better-sqlite3 (DEC-018). It is imported only here, so no other module depends on it.
+ *
  * Events and checkpoints are stored as their canonical JSON record so they read back byte-for-byte
  * as sealed (S03 verifyChain must still pass). Over-limit payloads never reach this file: the ledger
  * offloads them to CAS as payload_ref, and insertEvent refuses an inline payload over the limit.
  */
 import { closeSync, fchmodSync, openSync } from 'node:fs';
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 import { canonicalJSON } from '../ledger/canonical-json.js';
 import { MAX_INLINE_PAYLOAD_BYTES } from '../ledger/ledger.js';
 import type { BlobRef, Checkpoint, LedgerEvent, Run } from '../model/types.js';
@@ -90,11 +92,11 @@ function parseRecord<T>(row: Row, what: string): T {
 }
 
 export class IndexDb {
-  readonly #db: DatabaseSync;
-  readonly #statements = new Map<string, StatementSync>();
+  readonly #db: Database.Database;
+  readonly #statements = new Map<string, Database.Statement>();
   #closed = false;
 
-  private constructor(db: DatabaseSync) {
+  private constructor(db: Database.Database) {
     this.#db = db;
   }
 
@@ -105,13 +107,12 @@ export class IndexDb {
     } finally {
       closeSync(fd);
     }
-    const db = new DatabaseSync(file);
+    const db = new Database(file, { timeout: 5000 });
     try {
-      db.exec('PRAGMA busy_timeout = 5000');
-      db.exec('PRAGMA journal_mode = WAL');
-      db.exec('PRAGMA synchronous = FULL');
+      db.pragma('journal_mode = WAL');
+      db.pragma('synchronous = FULL');
       db.exec(SCHEMA);
-      const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('index_format');
+      const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('index_format') as Row | undefined;
       if (row === undefined) {
         db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('index_format', INDEX_FORMAT);
       } else if (row['value'] !== INDEX_FORMAT) {
@@ -131,30 +132,26 @@ export class IndexDb {
     this.#db.close();
   }
 
-  /** Run `fn` inside one write transaction (BEGIN IMMEDIATE … COMMIT, ROLLBACK on throw). */
+  /** Run `fn` inside one write transaction (BEGIN IMMEDIATE … COMMIT, rolled back if it throws). */
   transaction<T>(fn: () => T): T {
-    this.#db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = fn();
-      this.#db.exec('COMMIT');
-      return result;
-    } catch (err) {
-      try {
-        this.#db.exec('ROLLBACK');
-      } catch {
-        // the failed statement already ended the transaction
-      }
-      throw err;
-    }
+    return this.#db.transaction(fn).immediate();
   }
 
-  #stmt(sql: string): StatementSync {
+  #stmt(sql: string): Database.Statement {
     let statement = this.#statements.get(sql);
     if (statement === undefined) {
       statement = this.#db.prepare(sql);
       this.#statements.set(sql, statement);
     }
     return statement;
+  }
+
+  #get(sql: string, ...params: unknown[]): Row | undefined {
+    return this.#stmt(sql).get(...params) as Row | undefined;
+  }
+
+  #all(sql: string, ...params: unknown[]): Row[] {
+    return this.#stmt(sql).all(...params) as Row[];
   }
 
   // ── runs ──────────────────────────────────────────────────────────────────────────────────────
@@ -167,7 +164,7 @@ export class IndexDb {
   }
 
   getRun(runId: string): Run | undefined {
-    const row = this.#stmt('SELECT record FROM runs WHERE run_id = ?').get(runId);
+    const row = this.#get('SELECT record FROM runs WHERE run_id = ?', runId);
     return row === undefined ? undefined : parseRecord<Run>(row, 'run');
   }
 
@@ -192,14 +189,13 @@ export class IndexDb {
 
   /** Events with fromSeq <= seq <= toSeq, in seq order. */
   getEvents(runId: string, fromSeq: number, toSeq: number): LedgerEvent[] {
-    return this.#stmt('SELECT record FROM events WHERE run_id = ? AND seq >= ? AND seq <= ? ORDER BY seq')
-      .all(runId, fromSeq, toSeq)
-      .map((row) => parseRecord<LedgerEvent>(row, 'event'));
+    return this.#all('SELECT record FROM events WHERE run_id = ? AND seq >= ? AND seq <= ? ORDER BY seq', runId, fromSeq, toSeq).map((row) =>
+      parseRecord<LedgerEvent>(row, 'event'),
+    );
   }
 
   maxEventSeq(runId: string): number {
-    const row = this.#stmt('SELECT COALESCE(MAX(seq), 0) AS n FROM events WHERE run_id = ?').get(runId);
-    return Number(row?.['n'] ?? 0);
+    return Number(this.#get('SELECT COALESCE(MAX(seq), 0) AS n FROM events WHERE run_id = ?', runId)?.['n'] ?? 0);
   }
 
   // ── checkpoints ───────────────────────────────────────────────────────────────────────────────
@@ -222,14 +218,12 @@ export class IndexDb {
   }
 
   getCheckpoint(runId: string, checkpointId: string): Checkpoint | undefined {
-    const row = this.#stmt('SELECT record FROM checkpoints WHERE run_id = ? AND checkpoint_id = ?').get(runId, checkpointId);
+    const row = this.#get('SELECT record FROM checkpoints WHERE run_id = ? AND checkpoint_id = ?', runId, checkpointId);
     return row === undefined ? undefined : parseRecord<Checkpoint>(row, 'checkpoint');
   }
 
   listCheckpoints(runId: string): Checkpoint[] {
-    return this.#stmt('SELECT record FROM checkpoints WHERE run_id = ? ORDER BY n')
-      .all(runId)
-      .map((row) => parseRecord<Checkpoint>(row, 'checkpoint'));
+    return this.#all('SELECT record FROM checkpoints WHERE run_id = ? ORDER BY n', runId).map((row) => parseRecord<Checkpoint>(row, 'checkpoint'));
   }
 
   // ── blobs ─────────────────────────────────────────────────────────────────────────────────────
@@ -241,7 +235,7 @@ export class IndexDb {
   // ── maintenance ───────────────────────────────────────────────────────────────────────────────
 
   counts(): IndexCounts {
-    const count = (table: string): number => Number(this.#stmt(`SELECT COUNT(*) AS n FROM ${table}`).get()?.['n'] ?? 0);
+    const count = (table: string): number => Number(this.#get(`SELECT COUNT(*) AS n FROM ${table}`)?.['n'] ?? 0);
     return { runs: count('runs'), checkpoints: count('checkpoints'), events: count('events') };
   }
 
@@ -256,7 +250,7 @@ export class IndexDb {
   fileCache(runId: string): FileCache {
     return {
       get: (relPath) => {
-        const row = this.#stmt('SELECT * FROM file_cache WHERE run_id = ? AND path = ?').get(runId, relPath);
+        const row = this.#get('SELECT * FROM file_cache WHERE run_id = ? AND path = ?', runId, relPath);
         if (row === undefined) return undefined;
         const entry: FileCacheEntry = {
           path: String(row['path']),
@@ -276,7 +270,7 @@ export class IndexDb {
       delete: (relPath) => {
         this.#stmt('DELETE FROM file_cache WHERE run_id = ? AND path = ?').run(runId, relPath);
       },
-      paths: () => this.#stmt('SELECT path FROM file_cache WHERE run_id = ? ORDER BY path').all(runId).map((row) => String(row['path'])),
+      paths: () => this.#all('SELECT path FROM file_cache WHERE run_id = ? ORDER BY path', runId).map((row) => String(row['path'])),
     };
   }
 }

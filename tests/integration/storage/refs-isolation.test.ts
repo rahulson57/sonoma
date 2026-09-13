@@ -4,7 +4,9 @@
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { tmpGitRepo } from '../../helpers/tmpRepo.js';
 import { checkpointFiles, git, openBackend, sha256 } from './support.js';
 

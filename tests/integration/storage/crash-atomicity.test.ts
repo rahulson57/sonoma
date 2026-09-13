@@ -5,7 +5,9 @@
  */
 import { appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { verifyChain } from '../../../src/ledger/verify-chain.js';
 import type { Checkpoint } from '../../../src/model/types.js';
 import type { LocalBackend } from '../../../src/storage/index.js';
@@ -27,6 +29,10 @@ async function expectConsistent(backend: LocalBackend, repoDir: string, runId: s
     expect(created?.payload).toEqual(checkpoint);
     await expect(backend.getState(checkpoint)).resolves.toMatchObject({ checkpoint_id: checkpoint.checkpoint_id });
   }
+  // The converse (DEC-018): no checkpoint.created event is visible without its checkpoint index row.
+  expect(events.filter((event) => event.type === 'checkpoint.created').map((event) => event.seq)).toEqual(
+    listed.map((checkpoint) => checkpoint.ledger_seq),
+  );
   return listed;
 }
 

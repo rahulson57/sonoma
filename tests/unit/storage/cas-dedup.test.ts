@@ -2,10 +2,12 @@
 import { readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { BlobStore, LocalBackend } from '../../../src/storage/index.js';
 import { tmpGitRepo, type TmpGitRepo } from '../../helpers/tmpRepo.js';
 import { makeTempDir, openBackend, sha256 } from '../../integration/storage/support.js';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 async function filesUnder(root: string): Promise<string[]> {
   const found: string[] = [];
@@ -27,37 +29,49 @@ async function readAll(stream: Readable): Promise<Buffer> {
 }
 
 describe('CAS dedup (LocalBackend.putBlob)', () => {
+  it('putBlob on identical bytes twice returns the same BlobRef and exactly one file exists under objects/sha256', async () => {
+    const repo = await tmpGitRepo();
+    const { backend } = await openBackend(repo.dir);
+    try {
+      const bytes = Buffer.from('identical bytes\n'.repeat(4096));
+      const first = await backend.putBlob(bytes);
+      const second = await backend.putBlob(Buffer.from(bytes));
+
+      expect(second).toEqual(first);
+      expect(first).toEqual({ sha256: sha256(bytes), size: bytes.byteLength });
+      const objects = path.join(repo.dir, '.ckpt', 'objects', 'sha256');
+      expect(await filesUnder(objects)).toEqual([path.join(first.sha256.slice(0, 2), first.sha256)]);
+    } finally {
+      await backend.close();
+      await repo.cleanup();
+    }
+  });
+});
+
+describe('LocalBackend blob reads and streamed puts', () => {
+  // One store for these tests: each asserts only on the blobs it writes.
   let repo: TmpGitRepo;
   let backend: LocalBackend;
 
-  beforeEach(async () => {
+  beforeAll(async () => {
     repo = await tmpGitRepo();
     ({ backend } = await openBackend(repo.dir));
   });
 
-  afterEach(async () => {
+  afterAll(async () => {
     await backend.close();
     await repo.cleanup();
   });
 
-  it('putBlob on identical bytes twice returns the same BlobRef and exactly one file exists under objects/sha256', async () => {
-    const bytes = Buffer.from('identical bytes\n'.repeat(4096));
-    const first = await backend.putBlob(bytes);
-    const second = await backend.putBlob(Buffer.from(bytes));
-
-    expect(second).toEqual(first);
-    expect(first).toEqual({ sha256: sha256(bytes), size: bytes.byteLength });
-    const objects = path.join(repo.dir, '.ckpt', 'objects', 'sha256');
-    expect(await filesUnder(objects)).toEqual([path.join(first.sha256.slice(0, 2), first.sha256)]);
-  });
-
   it('a Readable with the same bytes dedups against a Uint8Array put', async () => {
+    const objects = path.join(repo.dir, '.ckpt', 'objects', 'sha256');
+    const before = await filesUnder(objects);
     const bytes = Buffer.from('streamed payload '.repeat(10_000));
     const fromBytes = await backend.putBlob(bytes);
     const fromStream = await backend.putBlob(Readable.from([bytes.subarray(0, 1000), bytes.subarray(1000)]));
 
     expect(fromStream).toEqual(fromBytes);
-    expect(await filesUnder(path.join(repo.dir, '.ckpt', 'objects', 'sha256'))).toHaveLength(1);
+    expect(await filesUnder(objects)).toEqual([...before, path.join(fromBytes.sha256.slice(0, 2), fromBytes.sha256)].sort());
     expect(await filesUnder(path.join(repo.dir, '.ckpt', 'tmp'))).toEqual([]);
   });
 

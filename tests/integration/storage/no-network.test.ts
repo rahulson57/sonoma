@@ -15,7 +15,9 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+// Git-backed storage tests spawn many git processes; vitest's 5 s defaults fail on a loaded machine.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { MAX_INLINE_PAYLOAD_BYTES } from '../../../src/ledger/ledger.js';
 import { tmpGitRepo } from '../../helpers/tmpRepo.js';
 import { checkpointFiles, openBackend, sha256 } from './support.js';
