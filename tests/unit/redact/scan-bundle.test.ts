@@ -24,7 +24,9 @@ function secretRange(content: string, value: string): { start: number; end: numb
   return { start: at, end: at + value.length };
 }
 
-describe('scanBundle', () => {
+// Several tests scan multi-megabyte buffers (seconds each). vitest's 5 s default is too tight when the
+// whole suite runs in parallel on a loaded machine, so these blocks set their own timeout.
+describe('scanBundle', { timeout: 30_000 }, () => {
   it('reports every corpus hit, with filesScanned equal to the input file count', async () => {
     const corpus = secretCorpus();
     const secretFiles = corpus.map(({ value }, i) => ({
@@ -114,7 +116,7 @@ describe('scanBundle', () => {
   });
 });
 
-describe('scanBytes — window handover', () => {
+describe('scanBytes — window handover', { timeout: 30_000 }, () => {
   // Small windows so every boundary can be swept: the second window's text starts at STEP - MARGIN
   // (and its scan one byte later), matches starting at STEP or later belong to it, and the first
   // window ends at WINDOW. STEP + MARGIN is where an earlier design handed over on long lines.
@@ -271,7 +273,7 @@ describe('scanBytes — window handover', () => {
     quoted.write(later, laterAt + 2000, 'latin1');
     quoted.write('\n', laterAt + 2000 + later.length + 40, 'latin1');
     expect(compareWithSinglePass(quoted, secretsAt.map((at) => at + 2000), pw.length)).toEqual([]);
-  }, 60_000);
+  }, 120_000); // four full scans of a 16 MB buffer
 
   it('reports exactly what a single pass reports on random text of assignments, quoted values, words, URLs, tokens and PEM blocks', () => {
     // This seed and generator found 5 of 150 texts where the previous handover (restarting each
