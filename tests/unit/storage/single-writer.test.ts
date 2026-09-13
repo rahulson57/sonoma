@@ -60,6 +60,15 @@ describe('RunLock', () => {
     await expect(RunLock.acquire(lockDir, RUN_B, { isProcessAlive: () => false })).rejects.toMatchObject({ code: 'ERR_RUN_LOCKED' });
   });
 
+  it('a create interrupted before its lockfile was linked into place does not hold the run', async () => {
+    // What a crash between writing the temp file and link() leaves behind.
+    await writeFile(`${runLockPath(lockDir, RUN_A)}.new-0123456789ab`, '', { mode: 0o600 });
+    const lock = await RunLock.acquire(lockDir, RUN_A);
+    expect(JSON.parse(await readFile(lock.path, 'utf8'))).toMatchObject({ pid: process.pid, token: lock.owner.token });
+    await expect(RunLock.acquire(lockDir, RUN_A)).rejects.toMatchObject({ code: 'ERR_RUN_LOCKED' });
+    await lock.release();
+  });
+
   it('release leaves a lockfile that is no longer its own', async () => {
     const lock = await RunLock.acquire(lockDir, RUN_A);
     const other = { pid: process.pid, hostname: os.hostname(), token: 'replaced', acquired_at: '2026-01-01T00:00:00.000Z' };

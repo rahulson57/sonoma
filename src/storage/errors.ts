@@ -5,6 +5,8 @@ export type StorageErrorCode =
   | 'ERR_RUN_LOCKED'
   | 'ERR_NOT_FOUND'
   | 'ERR_INVALID_INPUT'
+  /** A NewCheckpoint `changes` delta that does not fit its staging directory or parent tree (DEC-019(1)). */
+  | 'ERR_INVALID_CHANGES'
   /** Durable artifacts disagree with themselves (broken chain, bad blob, unreadable record). */
   | 'ERR_CORRUPT'
   | 'ERR_GIT'

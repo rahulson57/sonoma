@@ -9,6 +9,8 @@
  * - NewCheckpoint carries the caller-sanitized staging tree and the deterministic state inputs. Storage
  *   assigns checkpoint_id, builds the commit, and emits `checkpoint.created` itself, because that event
  *   records the workspace commit it produces.
+ * - NewCheckpoint may carry `changes`, the delta from the parent tree, so storage reads only changed
+ *   files (DEC-019(1)). Computing that delta is the caller's job; storage does not re-walk the workspace.
  */
 import type { Readable } from 'node:stream';
 import type {
@@ -37,6 +39,14 @@ export interface CheckpointRef {
   readonly checkpoint_id: string;
 }
 
+/** A workspace delta from a parent tree (DEC-019(1)). Paths are repo-relative POSIX paths, as in the commit. */
+export interface WorkspaceChanges {
+  /** Files and symlinks added or modified (content, executable bit or link target); read from stagingDir. */
+  readonly written: readonly string[];
+  /** Files and symlinks of the parent tree that are gone. */
+  readonly deleted: readonly string[];
+}
+
 export interface NewCheckpoint {
   readonly run_id: string;
   /** A checkpoint of the same run, or null (first checkpoint; a fork's first checkpoint). */
@@ -50,6 +60,17 @@ export interface NewCheckpoint {
    * applied by the caller before this point). Storage commits exactly its regular files and symlinks.
    */
   readonly stagingDir: string;
+  /**
+   * Optional delta from the parent tree (DEC-019(1)). The parent tree is the `parent_checkpoint_id`
+   * checkpoint's commit or, for a fork's first checkpoint, the source checkpoint's commit. When there is
+   * one, storage builds on it and reads only `written` from stagingDir, so unchanged files are never
+   * read. When there is none, `changes` is ignored and stagingDir is committed in full.
+   *
+   * A delta that does not fit fails with ERR_INVALID_CHANGES, and nothing is written. That covers a
+   * `written` path missing from stagingDir, a `deleted` path that is not a file of the parent tree, a
+   * path in both lists, and a file/directory clash with an entry the delta does not remove.
+   */
+  readonly changes?: WorkspaceChanges;
 }
 
 export interface StorageBackend {

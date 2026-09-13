@@ -12,6 +12,10 @@
  * its ref (pointing at the recorded commit) and its state blob are all durable. An orphan ref from a
  * crash before the event is never listed, and the next checkpoint overwrites it.
  *
+ * With a parent tree and a `changes` delta, the commit is built on the parent tree and only the written
+ * files are read (DEC-019(1)). A delta that does not fit fails with ERR_INVALID_CHANGES before step 1
+ * writes any object.
+ *
  * Single writer per run: the first write to a run takes `.ckpt/lock/<run>.lock` and holds it until
  * close(). Taking the lock replays anything the log holds that the index does not (roll-forward), so
  * the chain always continues from the durable head. If a write fails midway, the writer is dropped
@@ -40,7 +44,7 @@ import { BlobStore } from './cas.js';
 import { ChangeDetector, type ChangeDetectionFs } from './change-detection.js';
 import { StorageError } from './errors.js';
 import { ensureDir, errnoCode, fsyncDir, writeExclusive } from './fs-util.js';
-import { GitRepo } from './git.js';
+import { GitRepo, checkWorkspaceChanges } from './git.js';
 import { cryptoRandom, ulid, type RandomSource } from './ids.js';
 import { IndexDb } from './index-db.js';
 import {
@@ -262,6 +266,8 @@ export class LocalBackend implements StorageBackend {
     const label = input.label ?? null;
     if (label !== null && (typeof label !== 'string' || label === '')) throw invalid('label is a non-empty string or null');
     if (typeof input.stagingDir !== 'string' || input.stagingDir === '') throw invalid('stagingDir is required');
+    // Shape and path syntax now; the fit against stagingDir and the parent tree is checked by commitTree.
+    const changes = input.changes === undefined ? undefined : checkWorkspaceChanges(input.changes);
     // Validate the caller's state inputs before taking the writer lock.
     const probe = validateAgentState({
       schemaVersion: CURRENT_SCHEMA_VERSION,
@@ -292,9 +298,11 @@ export class LocalBackend implements StorageBackend {
       const seq = writer.head.seq + 1;
       const now = this.#clock.now();
 
-      // 1. Workspace objects from the sanitized staging tree (not reachable from any ref yet).
+      // 1. Workspace objects from the sanitized staging tree (not reachable from any ref yet). With a
+      //    parent commit and a delta, built on the parent's tree from the written files only.
       const { commit } = await this.#git.commitTree(input.stagingDir, {
         parent: parentCommit,
+        changes,
         message: `ckpt ${runId}/${checkpointId}`,
         timeMs: now,
         tmpDir: this.layout.tmp,

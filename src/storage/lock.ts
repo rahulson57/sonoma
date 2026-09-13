@@ -1,12 +1,14 @@
 /**
  * Single writer per run (SPEC-005 "Concurrency and durability"): a lockfile `.ckpt/lock/<run_id>.lock`.
  *
- * - Acquire = exclusive create (O_EXCL) of a 0600 file holding {pid, hostname, token}. While another
- *   holder's file exists, acquisition rejects with ERR_RUN_LOCKED.
+ * - Acquire = atomic create of a 0600 file holding {pid, hostname, token}: the content is written and
+ *   fsynced to a private temp file first, then link()ed into place, which fails while another holder's
+ *   file exists (ERR_RUN_LOCKED). The lockfile is therefore never visible empty or half-written, and a
+ *   crash mid-create leaves at most a stray `<run>.lock.new-*` temp file, which holds nothing.
  * - A lock left by a crashed process is reclaimed when its holder is on this host and its pid is no
  *   longer alive. Reclaim renames the stale file aside and re-checks its token, so two processes racing
  *   to reclaim the same stale lock cannot delete a lock one of them has just taken.
- * - A lockfile whose content cannot be read as an owner (e.g. a crash mid-create) is treated as held:
+ * - A lockfile whose content cannot be read as an owner (not one this module wrote) is treated as held:
  *   it cannot be proven dead. Remove it by hand only when no ckpt process is running.
  * - Release removes the file only if it still carries this holder's token.
  */
@@ -15,7 +17,7 @@ import { link, readFile, rename, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { StorageError } from './errors.js';
-import { errnoCode, writeExclusive } from './fs-util.js';
+import { errnoCode, fsyncDir, writeExclusive } from './fs-util.js';
 import { assertRunId } from './layout.js';
 
 export interface LockOwner {
@@ -82,6 +84,22 @@ function lockedError(runId: string, holder: LockOwner | null): StorageError {
   return new StorageError('ERR_RUN_LOCKED', `run ${runId} already has a writer (${who})`);
 }
 
+/** Create `file` holding `content` atomically (temp file, fsync, link). False when `file` already exists. */
+async function createLockfile(file: string, content: string): Promise<boolean> {
+  const tmp = `${file}.new-${randomBytes(6).toString('hex')}`;
+  await writeExclusive(tmp, content);
+  try {
+    await link(tmp, file);
+  } catch (err) {
+    if (errnoCode(err) === 'EEXIST') return false;
+    throw err;
+  } finally {
+    await unlink(tmp).catch(() => undefined);
+  }
+  await fsyncDir(path.dirname(file));
+  return true;
+}
+
 /** Move a stale lockfile aside; if it turns out not to be the stale one we saw, put it back. */
 async function reclaimStale(file: string, stale: LockOwner): Promise<void> {
   const aside = `${file}.stale-${randomBytes(6).toString('hex')}`;
@@ -125,12 +143,7 @@ export class RunLock {
     };
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await writeExclusive(file, JSON.stringify(owner));
-        return new RunLock(runId, file, owner);
-      } catch (err) {
-        if (errnoCode(err) !== 'EEXIST') throw err;
-      }
+      if (await createLockfile(file, JSON.stringify(owner))) return new RunLock(runId, file, owner);
       const holder = await readOwner(file);
       if (holder === undefined) continue; // released between our create and our read
       if (holder === null || holder.hostname !== owner.hostname || alive(holder.pid)) {
