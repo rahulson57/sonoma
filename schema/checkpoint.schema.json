@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/checkpoint.schema.json",
+  "title": "Checkpoint",
+  "description": "SPEC-004 Checkpoint = Agent State Object (state_blob) + workspace commit + ledger cursor. A pointer into the immutable ledger, never a copy of history. schemaVersion 1; an unknown schemaVersion is rejected.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "checkpoint_id",
+    "run_id",
+    "parent_checkpoint_id",
+    "label",
+    "state_blob",
+    "state_hash",
+    "workspace_commit",
+    "ledger_seq",
+    "usage",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "checkpoint_id": { "$ref": "common.schema.json#/$defs/CheckpointId" },
+    "run_id": { "$ref": "common.schema.json#/$defs/RunId" },
+    "parent_checkpoint_id": {
+      "anyOf": [{ "$ref": "common.schema.json#/$defs/CheckpointId" }, { "type": "null" }]
+    },
+    "label": {
+      "description": "Labelled checkpoints trigger distillation.",
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "state_blob": { "$ref": "common.schema.json#/$defs/BlobRef" },
+    "state_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "workspace_commit": {
+      "description": "Commit on refs/checkpoints/<run>/<checkpoint>.",
+      "$ref": "common.schema.json#/$defs/GitSha"
+    },
+    "ledger_seq": {
+      "description": "Cursor: seq of the last ledger event included.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "usage": { "$ref": "common.schema.json#/$defs/TokenUsage" },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

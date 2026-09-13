@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ckpt.local/schema/semantic-projection.schema.json",
+  "title": "SemanticProjection",
+  "description": "SPEC-007 versioned, derived projection for one checkpoint. Re-distilling creates a new projection id and never mutates an earlier one. Field names follow SPEC-007 verbatim.",
+  "type": "object",
+  "required": ["id", "checkpointId", "distiller", "input", "claims", "usage", "createdAt"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "checkpointId": { "$ref": "common.schema.json#/$defs/CheckpointId" },
+    "distiller": {
+      "type": "object",
+      "required": ["provider", "model", "promptVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "promptVersion": { "type": "string", "minLength": 1 }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["stateHash", "ledgerRange", "workspaceCommit"],
+      "additionalProperties": false,
+      "properties": {
+        "stateHash": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "ledgerRange": {
+          "description": "[previous checkpoint cursor (exclusive), this cursor (inclusive)].",
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "workspaceCommit": { "$ref": "common.schema.json#/$defs/GitSha" }
+      }
+    },
+    "claims": { "type": "array", "items": { "$ref": "semantic-claim.schema.json" } },
+    "usage": {
+      "type": "object",
+      "required": ["inputTokens", "outputTokens", "costUsd"],
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "costUsd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "createdAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}
