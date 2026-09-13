@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "rootDir": ".",
+    "outDir": "dist",
+    "types": ["node"],
+    "isolatedModules": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "bin", "tests", "bench", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}
