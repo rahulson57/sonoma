@@ -1,0 +1,27 @@
+{
+  "name": "ckpt",
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ckpt": "dist/bin/ckpt.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:e2e": "vitest run --dir tests/e2e",
+    "test:ui": "playwright test",
+    "bench": "vitest bench --run --outputJson bench/results.json",
+    "bench:check": "tsx bench/check-budgets.ts --results bench/results.json"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "20.19.43",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}
