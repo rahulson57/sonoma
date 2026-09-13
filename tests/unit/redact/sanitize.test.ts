@@ -146,14 +146,42 @@ describe('sanitize — detection beyond the fixed corpus', () => {
       `{"client_secret": "${pw}", "retries": 3}`,
       `export API_TOKEN=${pw};rest-of-token`,
       `PRIVATE_KEY=${pem};tail`,
+      `PRIVATE_KEY=${pem} tail`,
       `OPTS=--password=${pw} --verbose`,
+      `{"db_password": 123456 , "user": "bob"}`,
+      `{"cmd": "API_TOKEN=${pw}\\nnext"}`,
     ].entries()) {
       const once = sanitize(input);
       expect(once.hits.length, `case #${index}`).toBeGreaterThan(0);
       expect(sanitize(once.output), `case #${index}`).toEqual({ output: once.output, hits: [] });
     }
-    const alreadyRedacted = 'API_TOKEN=[REDACTED:env_assignment];x';
-    expect(sanitize(alreadyRedacted)).toEqual({ output: alreadyRedacted, hits: [] });
+    const marker = '[REDACTED:env_assignment]';
+    for (const alreadyRedacted of [
+      `API_TOKEN=${marker};x`,
+      `API_TOKEN=${marker}`,
+      `API_TOKEN=${marker}   `,
+      `{"db_password": ${marker}, "user": "bob"}`,
+      `{"db_password": ${marker} }`,
+      `{"cmd": "API_TOKEN=${marker}\\nnext"}`,
+    ]) {
+      expect(sanitize(alreadyRedacted), alreadyRedacted).toEqual({ output: alreadyRedacted, hits: [] });
+    }
+  });
+
+  it('does not trust a redaction marker that runs into more value', () => {
+    // Pasted or appended text: a real value right after a marker is still a value.
+    const pw = ['hunter', '2', 'hunter', '2'].join('');
+    const marker = '[REDACTED:env_assignment]';
+    for (const line of [
+      `API_TOKEN=${marker}${pw}`,
+      `API_TOKEN=${marker} ${pw}`,
+      `{"api_token": ${marker}${pw}}`,
+      `DB_PASSWORD=[REDACTED:pem]${pw}`,
+    ]) {
+      const { output, hits } = sanitize(line);
+      expect(output, line).not.toContain(pw);
+      expect(hits.map((h) => h.kind), line).toContain('env_assignment');
+    }
   });
 
   it('redacts a credentialed URL password that itself contains "@"', () => {

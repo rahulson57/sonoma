@@ -115,14 +115,15 @@ describe('scanBundle', () => {
 });
 
 describe('scanBytes — window handover', () => {
-  // Small windows so every boundary can be swept: nominal handover at STEP, the mid-overlap
-  // handover used on long lines at STEP + MARGIN, and the first window's end at WINDOW.
+  // Small windows so every boundary can be swept: the second window's text starts at STEP - MARGIN
+  // (and its scan one byte later), matches starting at STEP or later belong to it, and the first
+  // window ends at WINDOW. STEP + MARGIN is where an earlier design handed over on long lines.
   const WINDOW = 2048;
   const OVERLAP = 512;
   const STEP = WINDOW - OVERLAP;
   const MARGIN = OVERLAP / 2;
   const SIZE = 3 * WINDOW;
-  const BOUNDARIES = [STEP, STEP + MARGIN, WINDOW];
+  const BOUNDARIES = [STEP - MARGIN, STEP, STEP + MARGIN, WINDOW];
   const pw = ['hunter', '2', 'hunter', '2'].join(''); // low-entropy fake: detected only by its context
   const FILLERS = [
     { name: 'short lines', text: 'lorem ipsum dolor sit amet\n', separator: '\n' },
@@ -144,7 +145,7 @@ describe('scanBytes — window handover', () => {
     const failures: string[] = [];
     for (const filler of FILLERS) {
       for (const boundary of BOUNDARIES) {
-        for (let at = boundary - line.length - 2; at <= boundary + 2; at += stride) {
+        for (let at = Math.max(1, boundary - line.length - 2); at <= boundary + 2; at += stride) {
           const bytes = withLineAt(filler, line, at);
           const single = scanBytes(bytes, 2 ** 30, 0);
           const secretAt = at + line.indexOf(secret);
@@ -208,4 +209,162 @@ describe('scanBytes — window handover', () => {
     expect(hits.some((h) => h.kind === 'github' && h.offset === text.indexOf(github))).toBe(true);
     expect(hits).toEqual(scanBytes(bytes, 2 ** 30, 0));
   });
+
+  /** Hits that differ from a single pass, or secrets (at `secretsAt`) the single pass does not cover. */
+  function compareWithSinglePass(bytes: Uint8Array, secretsAt: number[], secretLength: number, windowBytes?: number, overlapBytes?: number): string[] {
+    const failures: string[] = [];
+    const single = scanBytes(bytes, 2 ** 30, 0);
+    for (const at of secretsAt) {
+      if (!single.some((h) => h.offset <= at && h.offset + h.length >= at + secretLength)) failures.push(`single pass misses @${at}`);
+    }
+    if (JSON.stringify(scanBytes(bytes, windowBytes, overlapBytes)) !== JSON.stringify(single)) failures.push('windowed != single pass');
+    return failures;
+  }
+
+  it.each([
+    ['a word whose suffix is secret-named ("monkey=" holds "key=")', ' monkey=banana '],
+    ['a word whose suffix is secret-named ("OAUTH:" holds "AUTH:")', ' OAUTH: enabled '],
+    ['a quoted secret value that contains a secret-named assignment', '{"db_secret": "Server=db;Password=x;Timeout=30", "note": "nnnnnnnnnn", '],
+  ])('a window boundary inside %s does not hide a later secret on the same long line', (_name, trigger) => {
+    // One long line: the trigger swept across every boundary, then two secrets inside the second
+    // window's share (it hands over at 2 * STEP - MARGIN), then the end of the line.
+    const later = `"api_token": "${pw}"}, DB_PASSWORD=${pw}`;
+    const laterAt = 2 * STEP - MARGIN - 200;
+    const secretsAt = [laterAt + later.indexOf(pw), laterAt + later.lastIndexOf(pw)];
+    const failures: string[] = [];
+    for (const boundary of BOUNDARIES) {
+      for (let at = boundary - trigger.length - 2; at <= boundary + 2; at++) {
+        const bytes = Buffer.alloc(SIZE, 'lorem ipsum dolor sit amet ');
+        bytes.write(trigger, at, 'latin1');
+        bytes.write(later, laterAt, 'latin1');
+        bytes.write('\n', laterAt + later.length + 40, 'latin1');
+        for (const failure of compareWithSinglePass(bytes, secretsAt, pw.length, WINDOW, OVERLAP)) {
+          failures.push(`trigger @${at} (boundary ${boundary}): ${failure}`);
+        }
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it('at the default 8 MB / 128 KB windows, a boundary inside a word or a quoted secret value does not hide a later secret', () => {
+    const step = SCAN_WINDOW_BYTES - SCAN_OVERLAP_BYTES;
+    const margin = SCAN_OVERLAP_BYTES / 2;
+    const size = SCAN_WINDOW_BYTES + step; // two windows, handing over at `step`
+    const later = `"api_token": "${pw}"}, DB_PASSWORD=${pw}`;
+    const laterAt = step + margin + 3000;
+    const secretsAt = [laterAt + later.indexOf(pw), laterAt + later.lastIndexOf(pw)];
+
+    // Words whose suffix is secret-named, at the second window's first byte, at the handover, and
+    // where an earlier design started the second window's ownership.
+    const words = Buffer.alloc(size, 'lorem ipsum dolor sit amet ');
+    words.write(' OAUTH: enabled ', step - margin - 2, 'latin1'); // "A" at step - margin
+    words.write(' monkey=banana ', step - 4, 'latin1'); // "k" at step
+    words.write(' OAUTH: enabled ', step + margin - 2, 'latin1');
+    words.write(later, laterAt, 'latin1');
+    words.write('\n', laterAt + later.length + 40, 'latin1');
+    expect(compareWithSinglePass(words, secretsAt, pw.length)).toEqual([]);
+
+    // A quoted secret value, holding many secret-named assignments, around the whole handover.
+    const quoted = Buffer.alloc(size, 'lorem ipsum dolor sit amet ');
+    const value = 'Server=db;Password=x;Timeout=30;'.repeat(Math.ceil((2 * margin + 2000) / 32));
+    quoted.write(`{"db_secret": "${value}", `, step - margin - 1000, 'latin1');
+    quoted.write(later, laterAt + 2000, 'latin1');
+    quoted.write('\n', laterAt + 2000 + later.length + 40, 'latin1');
+    expect(compareWithSinglePass(quoted, secretsAt.map((at) => at + 2000), pw.length)).toEqual([]);
+  }, 60_000);
+
+  it('reports exactly what a single pass reports on random text of assignments, quoted values, words, URLs, tokens and PEM blocks', () => {
+    // This seed and generator found 5 of 150 texts where the previous handover (restarting each
+    // window's scan at its first byte) differed from a single pass.
+    const rng = seededRng(0x447);
+    const configs: Array<[windowBytes: number, overlapBytes: number]> = [[2048, 512], [1300, 600], [1100, 540]];
+    const failures: string[] = [];
+    let singlePassHits = 0;
+    for (let round = 0; round < 150; round++) {
+      // No line breaks, long lines or short lines. At most 8 KB, so a grown window always reaches
+      // the end of the text and no decision falls back to its line end.
+      const lineBreak = [0, 1 / 100, 1 / 10][Math.floor(rng() * 3)]!;
+      const bytes = Buffer.from(randomRecords(rng, 3000 + Math.floor(rng() * 5000), lineBreak), 'latin1');
+      const single = scanBytes(bytes, 2 ** 30, 0);
+      singlePassHits += single.length;
+      for (const [windowBytes, overlapBytes] of configs) {
+        if (JSON.stringify(scanBytes(bytes, windowBytes, overlapBytes)) !== JSON.stringify(single)) {
+          failures.push(`round ${round} (${windowBytes}/${overlapBytes})`);
+          break;
+        }
+      }
+    }
+    expect(singlePassHits).toBeGreaterThan(3000);
+    expect(failures).toEqual([]);
+  }, 60_000);
 });
+
+function randomBase64(rng: () => number, length: number): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  return Array.from({ length }, () => alphabet[Math.floor(rng() * alphabet.length)]).join('');
+}
+
+/**
+ * `length` characters of records: secret-named and plain assignments with quoted, JSON-escaped,
+ * literal and (rarely) bare values, words with a secret-named suffix, credentialed URLs, tokens,
+ * PEM blocks and stray punctuation. All values are low-entropy fakes or seeded random tokens.
+ */
+function randomRecords(rng: () => number, length: number, lineBreak: number): string {
+  const pick = <T,>(items: readonly T[]): T => items[Math.floor(rng() * items.length)]!;
+  const int = (n: number) => Math.floor(rng() * n);
+  const pw = ['hunter', '2', 'hunter', '2'].join('');
+  const token = () => randomBase64(rng, 20 + int(30));
+  const pemBegin = ['-----BEGIN ', 'RSA ', 'PRIVATE', ' KEY-----'].join('');
+  const pemEnd = ['-----END ', 'RSA ', 'PRIVATE', ' KEY-----'].join('');
+  const secretNames = ['api_token', 'DB_PASSWORD', 'client_secret', 'Password', 'db_secret', 'AUTH', 'key'];
+  const plainNames = ['LOG_LEVEL', 'user', 'monkey', 'OAUTH', 'bypass', 'note', 'Server', 'Timeout'];
+  const inner = () =>
+    pick([
+      'Server=db;Password=x;Timeout=30',
+      'user=bob; key=abc',
+      pw,
+      `ab\\"${pw}`,
+      `it\\'s ${pw}`,
+      'a b c',
+      `token: ${pw}`,
+      'OAUTH: enabled',
+      '[REDACTED:env_assignment]',
+      token(),
+      '',
+    ]);
+  const value = (): string => {
+    if (rng() < 0.05) return pick([inner(), `${pw};rest`, '[REDACTED:env_assignment]', `[REDACTED:env_assignment]${pw}`]);
+    return pick([`"${inner()}"`, `'${inner()}'`, `\\"${inner()}\\"`, String(int(99999)), 'true', 'null', `"${inner()}" x`]);
+  };
+  const record = (): string => {
+    switch (int(10)) {
+      case 0:
+      case 1:
+        return Array.from({ length: 1 + int(12) }, () => pick(['lorem', 'ipsum', 'dolor', 'sit', 'amet'])).join(' ');
+      case 2:
+        return `${pick([...secretNames, ...plainNames])}${pick(['=', ': ', ' = ', ':'])}${value()}`;
+      case 3:
+        return `"${pick([...secretNames, ...plainNames])}": ${value()}`;
+      case 4:
+        return `\\"${pick([...secretNames, ...plainNames])}\\": ${value()}`;
+      case 5:
+        return pick(['monkey=banana', 'OAUTH: enabled', 'bypass=1', 'compass: north', '{"db_secret": "Server=db;Password=x;Timeout=30", "note": "n"']);
+      case 6:
+        return pick([
+          ['postgres', '://', 'app_user', ':', pw, '@', 'db.internal.invalid/app'].join(''),
+          'https://example.invalid/x?a=1',
+          ['mysql', '://', 'root', ':', pw, '@@h/x'].join(''),
+          ['ey', 'Jabcdefghij.', 'ey', 'Jabcdefghij.', token()].join(''),
+        ]);
+      case 7:
+        return pick([token(), `x${token()}`, `${token()}==`]);
+      case 8:
+        return pick([`${pemBegin}\n${token()}\n${token()}\n${pemEnd}`, pemBegin, `${pemBegin}\n${token()}`]);
+      default:
+        return Array.from({ length: 1 + int(3) }, () => pick(['"', "'", '\\', '=', ':', '[', ']', '{', '}', ',', ';', '\\n', pw, 'key', '='])).join('');
+    }
+  };
+  let text = '';
+  while (text.length < length) text += record() + (rng() < lineBreak ? pick(['\n', '\r\n']) : pick([' ', ', ', '; ', ' & ', '']));
+  return text.slice(0, length);
+}

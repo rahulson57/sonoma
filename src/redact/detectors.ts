@@ -21,25 +21,18 @@ export interface SecretSpan {
   end: number;
 }
 
-/**
- * One detector decision, before overlapping spans are merged.
- * - `anchor`: where the underlying match starts. For env_assignment and db_url that is the NAME or
- *   scheme, BEFORE the span (which is only the value or password).
- * - `rank`: detector precedence; lower wins when spans are merged.
- */
+/** One detector decision, before overlapping spans are merged. `rank`: detector precedence; lower wins. */
 export interface SecretCandidate extends SecretSpan {
   rank: number;
-  anchor: number;
 }
 
 /**
  * A decision (accepted or rejected) that looked all the way to the end of the scanned text, so it
- * could change if the text went on. `start` is the span start when accepted, else the anchor.
+ * could change if the text went on. `start` is the span start when accepted, else the match start.
  */
 export interface CutCandidate {
   kind: string;
   rank: number;
-  anchor: number;
   start: number;
 }
 
@@ -108,8 +101,14 @@ function readUrlPassword(text: string, at: number): Selection {
 
 // ---- Secret-named assignment values --------------------------------------------------------------
 
-/** A value that already starts with a redaction marker was redacted by an earlier pass. */
-const MARKER_AT = /\[REDACTED:[a-z_]+\]/y;
+/**
+ * A value that starts with a redaction marker was redacted by an earlier pass, but only if the value
+ * ends at the marker: a delimiter or blanks to the end of the line follow it. A PEM block can end
+ * mid-line, so a pem marker may also be followed by a blank. A marker that runs into more value
+ * (`[REDACTED:env_assignment]hunter2`, pasted or appended text) is read as a value like any other.
+ */
+const MARKER_AT = /\[REDACTED:(?:pem\](?=[ \t])|[a-z_]+\](?=[ \t]*(?:[\r\n,;)}\]"'\\&|<>#]|$)))/y;
+const BLANKS = /[ \t]*/y;
 const DOUBLE_QUOTE_STOPS = /["\\\r\n]/g;
 const SINGLE_QUOTE_STOPS = /['\\\r\n]/g;
 /** A quoted value ends the value only when the quote is followed by a delimiter. */
@@ -169,7 +168,11 @@ function closingEscapedQuote(text: string, at: number): number {
  */
 function readSecretValue(text: string, at: number, afterQuotedKey: boolean): Selection {
   const marker = execAt(MARKER_AT, text, at);
-  if (marker) return { reject: true, resumeAt: at + marker[0].length };
+  if (marker) {
+    // The look-ahead read the blanks after the marker and one character more.
+    const end = at + marker[0].length;
+    return { reject: true, resumeAt: end, decidedEnd: end + execAt(BLANKS, text, end)![0].length + 1 };
+  }
 
   const quote = text.startsWith('\\"', at) ? 2 : text[at] === '"' || text[at] === "'" ? 1 : 0;
   if (quote > 0) {
@@ -302,33 +305,57 @@ export function isRedactionMarker(text: string): boolean {
   return REDACTION_MARKER.test(text);
 }
 
+/** Number of detectors: the length of `from` and `resume` in a windowed scan. */
+export const DETECTOR_COUNT = DETECTORS.length;
+
+/** Where a scan of one window starts and stops (see `scanBytes`). */
+export interface CandidateScanOptions {
+  /** Per detector, in precedence order: the index its scan starts at. Default 0. */
+  from?: readonly number[];
+  /** Matches starting at or after this index are not decided; they are the next window's. */
+  until?: number;
+}
+
+export interface CandidateScan {
+  found: SecretCandidate[];
+  /** Decisions that read to the end of `text`. */
+  cut: CutCandidate[];
+  /** Per detector, in precedence order: the index its scan continues from. */
+  resume: number[];
+}
+
 /**
  * Every detector decision over `text`, unmerged, plus the decisions that read to the end of `text`
  * (`cut`). A span that is exactly a redaction marker is already-redacted content and is not
  * reported again, so sanitizing sanitized output is a no-op.
+ *
+ * Each detector scans independently: it decides a match, continues where that decision says, and
+ * so on. `from`, `until` and `resume` let a windowed scan continue that sequence in the next window
+ * instead of restarting it.
  */
-export function findSecretCandidates(text: string): { found: SecretCandidate[]; cut: CutCandidate[] } {
+export function findSecretCandidates(text: string, { from, until = Infinity }: CandidateScanOptions = {}): CandidateScan {
   const found: SecretCandidate[] = [];
   const cut: CutCandidate[] = [];
+  const resume: number[] = [];
   DETECTORS.forEach((detector, rank) => {
-    const { pattern } = detector;
-    pattern.lastIndex = 0;
+    let cursor = from?.[rank] ?? 0;
     let match: RegExpExecArray | null;
-    while ((match = pattern.exec(text)) !== null) {
+    while ((match = execAt(detector.pattern, text, cursor)) !== null && match.index < until) {
       const matchEnd = match.index + match[0].length;
       const selected = detector.select(match, text);
       const resumeAt = Math.max(selected.resumeAt ?? matchEnd, match.index + 1);
       const accepted = 'reject' in selected ? null : selected;
       if ((selected.decidedEnd ?? Math.max(matchEnd, resumeAt)) >= text.length) {
-        cut.push({ kind: detector.kind, rank, anchor: match.index, start: accepted ? accepted.start : match.index });
+        cut.push({ kind: detector.kind, rank, start: accepted ? accepted.start : match.index });
       }
       if (accepted && accepted.end > accepted.start && !isRedactionMarker(text.slice(accepted.start, accepted.end))) {
-        found.push({ kind: detector.kind, rank, anchor: match.index, start: accepted.start, end: accepted.end });
+        found.push({ kind: detector.kind, rank, start: accepted.start, end: accepted.end });
       }
-      pattern.lastIndex = resumeAt;
+      cursor = resumeAt;
     }
+    resume.push(cursor);
   });
-  return { found, cut };
+  return { found, cut, resume };
 }
 
 /**
