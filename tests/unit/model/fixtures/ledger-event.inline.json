@@ -1,0 +1,14 @@
+{
+  "event_id": "evt_0001",
+  "run_id": "run_01J8Z3K5QW7XV2M9N4P6R8T0AB",
+  "seq": 1,
+  "ts": "2026-09-13T12:00:00.000Z",
+  "type": "run.created",
+  "actor": "runtime",
+  "payload": {
+    "agent": "claude-code"
+  },
+  "payload_ref": null,
+  "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hash": "184a56fb3a98d6d977ed5af8dc86f961372eaf47000e32f0e894ece8ef3d2080"
+}

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "run_id": "run_01J8Z3K5QW7XV2M9N4P6R8T0AB",
+  "checkpoint_id": "c_2",
+  "ledger_seq": 8,
+  "workspace_commit": "87b805cfcd7f422dc6c23c57179d7c0929d3147d",
+  "pending_intent": [
+    {
+      "kind": "tool",
+      "intent_id": "tool_3",
+      "request_event_id": "evt_0006",
+      "status": "completed",
+      "requested_seq": 6,
+      "resolved_seq": 7
+    },
+    {
+      "kind": "tool",
+      "intent_id": "tool_4",
+      "request_event_id": "evt_0008",
+      "status": "in_progress",
+      "requested_seq": 8,
+      "resolved_seq": null
+    }
+  ],
+  "usage": {
+    "input_tokens": 18234,
+    "output_tokens": 2210
+  }
+}

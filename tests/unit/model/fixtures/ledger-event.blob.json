@@ -1,0 +1,15 @@
+{
+  "event_id": "evt_0002",
+  "run_id": "run_01J8Z3K5QW7XV2M9N4P6R8T0AB",
+  "seq": 2,
+  "ts": "2026-09-13T12:00:01.250Z",
+  "type": "tool.completed",
+  "actor": "runtime",
+  "payload": null,
+  "payload_ref": {
+    "sha256": "b9cd39b13a9b09801bfd3ad7461fcced367d6d912f17a18cfe2ba0d264c045c2",
+    "size": 2000000
+  },
+  "prev_hash": "184a56fb3a98d6d977ed5af8dc86f961372eaf47000e32f0e894ece8ef3d2080",
+  "hash": "e9cf1c5f60ee525dc80f1c4754632a62921c719859b0f0705cb688fcfb13b01c"
+}

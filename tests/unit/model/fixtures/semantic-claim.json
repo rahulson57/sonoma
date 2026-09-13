@@ -1,0 +1,18 @@
+{
+  "field": "next_action",
+  "value": "Run the ledger unit tests",
+  "origin": "agent_declared",
+  "confidence": 0.8,
+  "provenance": {
+    "event_ids": [
+      "evt_0002"
+    ],
+    "artifact_refs": [],
+    "workspace_paths": [
+      "src/ledger/ledger.ts"
+    ],
+    "checkpoint_ids": [
+      "c_1"
+    ]
+  }
+}
