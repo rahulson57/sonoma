@@ -24,3 +24,7 @@ coverage/
 test-results/
 playwright-report/
 *.tsbuildinfo
+
+# ckpt scaffold (SPEC-001): benchmark output and the local checkpoint store
+bench/results.json
+.agent/
