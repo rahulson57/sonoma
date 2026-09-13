@@ -3,6 +3,7 @@ import { secretCorpus } from '../../helpers/fakeSecrets.js';
 import { seededRng } from '../../helpers/prng.js';
 import { scanBundle } from '../../../src/redact/index.js';
 import { SCAN_OVERLAP_BYTES, SCAN_WINDOW_BYTES, scanBytes } from '../../../src/redact/bundle.js';
+import type { RedactionHit } from '../../../src/redact/sanitize.js';
 import { FINGERPRINT_FORMAT, sha256Fingerprint } from './leak.js';
 
 type BundleFile = { path: string; bytes: Uint8Array };
@@ -212,6 +213,30 @@ describe('scanBytes — window handover', { timeout: 30_000 }, () => {
     expect(hits).toEqual(scanBytes(bytes, 2 ** 30, 0));
   });
 
+  it('covers a PEM base64 run with no END line, longer than the largest window, through its end', () => {
+    // 16 KB windows grow to at most 128 KB; the run is ~200 KB of 64-character lines.
+    const windowBytes = 16_384;
+    const overlapBytes = 4096;
+    const header = ['-----BEGIN ', 'RSA ', 'PRIVATE', ' KEY-----'].join('');
+    const run = `${'A'.repeat(64)}\n`.repeat(3100);
+    const failures: string[] = [];
+    // The header in the first window's share, just before its handover, and just after it.
+    for (const at of [120, windowBytes - overlapBytes - 40, windowBytes - overlapBytes + 10]) {
+      const prefix = 'lorem ipsum dolor sit amet\n'.repeat(Math.ceil(at / 27)).slice(0, at - 1);
+      const text = `${prefix}\n${header}\n${run}. done\n`; // "." is the first byte past the run
+      const bytes = encode(text);
+      const single = scanBytes(bytes, 2 ** 30, 0);
+      const windowed = scanBytes(bytes, windowBytes, overlapBytes);
+      const pemEnd = text.indexOf('. done');
+      if (!single.some((h) => h.kind === 'pem' && h.offset === at && h.offset + h.length === pemEnd)) {
+        failures.push(`@${at}: single pass does not report the whole run`);
+      }
+      const missing = bytesLeftUncovered(single, windowed);
+      if (missing > 0) failures.push(`@${at}: ${missing} bytes a single pass covers are not covered`);
+    }
+    expect(failures).toEqual([]);
+  });
+
   /** Hits that differ from a single pass, or secrets (at `secretsAt`) the single pass does not cover. */
   function compareWithSinglePass(bytes: Uint8Array, secretsAt: number[], secretLength: number, windowBytes?: number, overlapBytes?: number): string[] {
     const failures: string[] = [];
@@ -300,6 +325,24 @@ describe('scanBytes — window handover', { timeout: 30_000 }, () => {
     expect(failures).toEqual([]);
   }, 60_000);
 });
+
+/** Bytes that hits in `covered` cover and no hit in `covering` does. Both are sorted and disjoint. */
+function bytesLeftUncovered(covered: RedactionHit[], covering: RedactionHit[]): number {
+  let missing = 0;
+  for (const { offset, length } of covered) {
+    let at = offset;
+    const end = offset + length;
+    for (const hit of covering) {
+      if (hit.offset + hit.length <= at) continue;
+      if (hit.offset >= end) break;
+      if (hit.offset > at) missing += hit.offset - at;
+      at = Math.max(at, hit.offset + hit.length);
+      if (at >= end) break;
+    }
+    if (at < end) missing += end - at;
+  }
+  return missing;
+}
 
 function randomBase64(rng: () => number, length: number): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';

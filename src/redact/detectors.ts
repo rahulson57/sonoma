@@ -34,14 +34,23 @@ export interface CutCandidate {
   kind: string;
   rank: number;
   start: number;
+  /**
+   * Set only for a detector whose matches can cross line breaks (a PEM block). `end` is the span
+   * end, and the scan of the detector continues there. `runsOn` is set when the match reached the
+   * end of the text over a run of characters and would go on over more of them: a sticky pattern
+   * of one repeated character class, so the run can be followed in pieces.
+   */
+  crossesLines?: { end: number; runsOn?: RegExp };
 }
 
 type Selection =
-  | { start: number; end: number; resumeAt?: number; decidedEnd?: number }
+  | { start: number; end: number; resumeAt?: number; decidedEnd?: number; runsOn?: RegExp }
   | { reject: true; resumeAt: number; decidedEnd?: number };
 
 interface Detector {
   kind: string;
+  /** True when a match can run across line breaks. */
+  crossesLines?: boolean;
   /** Must carry the `g` and `d` flags. */
   pattern: RegExp;
   /**
@@ -57,6 +66,10 @@ const PRIVATE_KEY = ['PRIVATE', 'KEY'].join(' ');
 const PEM_BEGIN = `${DASHES}BEGIN `;
 /** Longest PEM body searched for a matching END line before falling back to the base64 run. */
 const PEM_MAX_BODY = 65_536;
+/** One character of a PEM body read without its END line: base64, line breaks, escaped newlines. */
+const PEM_BODY_CHAR = '[A-Za-z0-9+/=\\r\\n\\\\]';
+/** A run of PEM body characters (see CutCandidate.crossesLines). */
+const PEM_BODY_RUN = new RegExp(`${PEM_BODY_CHAR}*`, 'y');
 
 /** The whole match is the secret. */
 const wholeMatch = (match: RegExpExecArray) => ({ start: match.index, end: match.index + match[0].length });
@@ -203,26 +216,32 @@ function readSecretValue(text: string, at: number, afterQuotedKey: boolean): Sel
 const DETECTORS: readonly Detector[] = [
   {
     kind: 'pem',
+    crossesLines: true,
     // A complete BEGIN…END private key block, or (truncated output) BEGIN plus the base64 run after
     // it. The END search never runs past another BEGIN line, so a run of BEGIN lines with no END
     // (grep output) is scanned once, not once per line.
     pattern: new RegExp(
       `${PEM_BEGIN}([A-Z0-9 ]*)${PRIVATE_KEY}( BLOCK)?${DASHES}` +
         `(?:((?:[^-]|-(?!${PEM_BEGIN.slice(1)})){0,${PEM_MAX_BODY}}?${DASHES}END \\1${PRIVATE_KEY}\\2${DASHES})` +
-        `|[A-Za-z0-9+/=\\r\\n\\\\]*)`,
+        `|${PEM_BODY_CHAR}*)`,
       'gd',
     ),
     select(match, text) {
       const end = match.index + match[0].length;
       if (match[3] !== undefined) return { start: match.index, end };
       // No END line: that decision read up to PEM_MAX_BODY characters past the header, or up to the
-      // next BEGIN line.
+      // next BEGIN line. A base64 run that reaches the end of the text would go on with more text.
       const label = `${match[1] ?? ''}${PRIVATE_KEY}${match[2] ?? ''}`;
       const headerEnd = match.index + PEM_BEGIN.length + label.length + DASHES.length;
       let horizon = headerEnd + PEM_MAX_BODY + `${DASHES}END ${label}${DASHES}`.length;
       const nextBegin = text.indexOf(PEM_BEGIN, headerEnd);
       if (nextBegin !== -1) horizon = Math.min(horizon, nextBegin + PEM_BEGIN.length);
-      return { start: match.index, end, decidedEnd: Math.max(end, horizon) };
+      return {
+        start: match.index,
+        end,
+        decidedEnd: Math.max(end, horizon),
+        ...(end >= text.length ? { runsOn: PEM_BODY_RUN } : {}),
+      };
     },
   },
   {
@@ -346,7 +365,14 @@ export function findSecretCandidates(text: string, { from, until = Infinity }: C
       const resumeAt = Math.max(selected.resumeAt ?? matchEnd, match.index + 1);
       const accepted = 'reject' in selected ? null : selected;
       if ((selected.decidedEnd ?? Math.max(matchEnd, resumeAt)) >= text.length) {
-        cut.push({ kind: detector.kind, rank, start: accepted ? accepted.start : match.index });
+        cut.push({
+          kind: detector.kind,
+          rank,
+          start: accepted ? accepted.start : match.index,
+          ...(detector.crossesLines
+            ? { crossesLines: { end: accepted ? accepted.end : matchEnd, ...(accepted?.runsOn ? { runsOn: accepted.runsOn } : {}) } }
+            : {}),
+        });
       }
       if (accepted && accepted.end > accepted.start && !isRedactionMarker(text.slice(accepted.start, accepted.end))) {
         found.push({ kind: detector.kind, rank, start: accepted.start, end: accepted.end });
