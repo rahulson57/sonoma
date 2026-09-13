@@ -1,6 +1,6 @@
 import { configDefaults, defineConfig } from 'vitest/config';
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   test: {
     // `npm test` runs unit (tests/unit/**) and integration (tests/integration/**) tests only.
     // The include glob is relative to the scan directory, so `vitest run --dir tests/e2e`
@@ -8,11 +8,14 @@ export default defineConfig({
     // Playwright specs (`*.spec.ts`, run by `npm run test:ui`) never match.
     include: ['**/*.test.ts'],
     exclude: [...configDefaults.exclude, 'tests/e2e/**', 'bench/**'],
+    // `npm run bench` (mode "benchmark") exits 0 and writes an empty report ({"files": []}) until
+    // the Performance Envelope scenarios exist. Benchmark mode only: `npm test` with no test files
+    // still fails.
+    passWithNoTests: mode === 'benchmark',
     benchmark: {
-      include: ['bench/**/*.bench.ts'],
-      // Raw per-iteration samples in bench/results.json so bench:check can compute p95
-      // (vitest's summary only reports p75/p99).
-      includeSamples: true,
+      // SPEC-001: `npm run bench` runs vitest bench over bench/scenarios/** (owned by SPEC-014).
+      // p95 and per-phase timings come from bench/phases.ts, not from vitest's samples.
+      include: ['bench/scenarios/**/*.bench.ts'],
     },
   },
-});
+}));

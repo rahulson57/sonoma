@@ -9,7 +9,7 @@
  * stays greppable.
  */
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -78,6 +78,8 @@ describe('vitest config', () => {
       'tests/e2e/ui/d.spec.ts',
       'bench/e.bench.ts',
       'bench/f.test.ts',
+      'bench/scenarios/g.bench.ts',
+      'bench/scenarios/h.test.ts',
     ];
 
     beforeAll(async () => {
@@ -105,6 +107,53 @@ describe('vitest config', () => {
       'npm run test:e2e (--dir) still reaches the e2e suite',
       async () => {
         expect(await vitestListFiles(sentinelRoot, ['--dir', 'tests/e2e'])).toEqual(['tests/e2e/c.test.ts']);
+      },
+      TIMEOUT_MS,
+    );
+  });
+
+  describe('with no test or scenario files at all', () => {
+    /** Run the vitest CLI with the repository config in a fresh empty temp root; never rejects. */
+    async function vitestInEmptyRoot(args: string[]): Promise<{ code: number; root: string; output: string }> {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'ckpt-vitest-empty-'));
+      const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('VITEST')));
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          process.execPath,
+          [vitestCli, ...args, '--config', path.join(repoRoot, 'vitest.config.ts'), '--root', root],
+          { cwd: root, env, maxBuffer: 16 * 1024 * 1024 },
+        );
+        return { code: 0, root, output: stdout + stderr };
+      } catch (err) {
+        const e = err as { code?: unknown; stdout?: string; stderr?: string };
+        return { code: typeof e.code === 'number' ? e.code : -1, root, output: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+      }
+    }
+
+    it(
+      'npm run bench exits 0 and writes an empty report before any scenario exists',
+      async () => {
+        const { code, root, output } = await vitestInEmptyRoot(['bench', '--run', '--outputJson', 'bench/results.json']);
+        try {
+          expect(code, output).toBe(0);
+          expect(JSON.parse(await readFile(path.join(root, 'bench', 'results.json'), 'utf8'))).toEqual({ files: [] });
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT_MS,
+    );
+
+    it(
+      'npm test still fails when it finds no test files (passWithNoTests is benchmark-only)',
+      async () => {
+        const { code, root, output } = await vitestInEmptyRoot(['run']);
+        try {
+          expect(code, output).not.toBe(0);
+          expect(output).toMatch(/No test files found/);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
       },
       TIMEOUT_MS,
     );

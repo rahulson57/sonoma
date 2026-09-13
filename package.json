@@ -15,7 +15,7 @@
     "test:e2e": "vitest run --dir tests/e2e",
     "test:ui": "playwright test",
     "bench": "vitest bench --run --outputJson bench/results.json",
-    "bench:check": "tsx bench/check.ts bench/results.json"
+    "bench:check": "tsx bench/check-budgets.ts --results bench/results.json"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

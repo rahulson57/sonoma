@@ -1,0 +1,204 @@
+{
+  "files": [
+    {
+      "filepath": "/repo/bench/scenarios/a-small-change.bench.ts",
+      "groups": [
+        {
+          "fullName": "bench/scenarios/a-small-change.bench.ts > a-small-change",
+          "benchmarks": [
+            {
+              "id": "fixture_a-small-change_0",
+              "name": "checkpoint",
+              "rank": 1,
+              "rme": 2.4,
+              "samples": [],
+              "totalTime": 4248,
+              "min": 180.5,
+              "max": 301.7,
+              "hz": 4.708,
+              "mean": 212.4,
+              "p75": 229.4,
+              "p99": 298.7,
+              "p995": 301.7,
+              "p999": 301.7,
+              "sampleCount": 20,
+              "median": 206,
+              "scenario": "a-small-change",
+              "budgetMs": 500,
+              "p95Ms": 612.4,
+              "phases": {
+                "changeDetection": 61,
+                "scanRedact": 40.2,
+                "hash": 15.9,
+                "blobWrite": 13.4,
+                "gitCommit": 104.1,
+                "ledgerAppend": 5.2,
+                "indexUpdate": 27.9
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "filepath": "/repo/bench/scenarios/b-many-files.bench.ts",
+      "groups": [
+        {
+          "fullName": "bench/scenarios/b-many-files.bench.ts > b-many-files",
+          "benchmarks": [
+            {
+              "id": "fixture_b-many-files_0",
+              "name": "checkpoint",
+              "rank": 1,
+              "rme": 2.4,
+              "samples": [],
+              "totalTime": 7038,
+              "min": 299.1,
+              "max": 466,
+              "hz": 2.842,
+              "mean": 351.9,
+              "p75": 380.1,
+              "p99": 461.3,
+              "p995": 466,
+              "p999": 466,
+              "sampleCount": 20,
+              "median": 341.3,
+              "scenario": "b-many-files",
+              "budgetMs": 500,
+              "p95Ms": 418.3,
+              "phases": {
+                "changeDetection": 238.6,
+                "scanRedact": 22.1,
+                "hash": 9.4,
+                "blobWrite": 7.7,
+                "gitCommit": 96.2,
+                "ledgerAppend": 4.8,
+                "indexUpdate": 36.5
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "filepath": "/repo/bench/scenarios/d-secret-output.bench.ts",
+      "groups": [
+        {
+          "fullName": "bench/scenarios/d-secret-output.bench.ts > d-secret-output",
+          "benchmarks": [
+            {
+              "id": "fixture_d-secret-output_0",
+              "name": "checkpoint",
+              "rank": 1,
+              "rme": 2.4,
+              "samples": [],
+              "totalTime": 26024,
+              "min": 1106,
+              "max": 1530.4,
+              "hz": 0.769,
+              "mean": 1301.2,
+              "p75": 1405.3,
+              "p99": 1515.1,
+              "p995": 1530.4,
+              "p999": 1530.4,
+              "sampleCount": 20,
+              "median": 1262.2,
+              "scenario": "d-secret-output",
+              "budgetMs": null,
+              "p95Ms": 1412.7,
+              "phases": {
+                "changeDetection": 18.3,
+                "scanRedact": 1288.4,
+                "hash": 41.7,
+                "blobWrite": 36.2,
+                "gitCommit": 22.9,
+                "ledgerAppend": 2.6,
+                "indexUpdate": 5.1
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "filepath": "/repo/bench/scenarios/e-noop.bench.ts",
+      "groups": [
+        {
+          "fullName": "bench/scenarios/e-noop.bench.ts > e-noop",
+          "benchmarks": [
+            {
+              "id": "fixture_e-noop_0",
+              "name": "checkpoint",
+              "rank": 1,
+              "rme": 2.4,
+              "samples": [],
+              "totalTime": 676,
+              "min": 28.7,
+              "max": 58.2,
+              "hz": 29.586,
+              "mean": 33.8,
+              "p75": 36.5,
+              "p99": 57.6,
+              "p995": 58.2,
+              "p999": 58.2,
+              "sampleCount": 20,
+              "median": 32.8,
+              "scenario": "e-noop",
+              "budgetMs": 100,
+              "p95Ms": 41.6,
+              "phases": {
+                "changeDetection": 30.2,
+                "scanRedact": 0,
+                "hash": 0,
+                "blobWrite": 0,
+                "gitCommit": 0,
+                "ledgerAppend": 3.1,
+                "indexUpdate": 6.8
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "filepath": "/repo/bench/scenarios/f-initial.bench.ts",
+      "groups": [
+        {
+          "fullName": "bench/scenarios/f-initial.bench.ts > f-initial",
+          "benchmarks": [
+            {
+              "id": "fixture_f-initial_0",
+              "name": "checkpoint",
+              "rank": 1,
+              "rme": 2.4,
+              "samples": [],
+              "totalTime": 422058,
+              "min": 17937.5,
+              "max": 22310.8,
+              "hz": 0.047,
+              "mean": 21102.9,
+              "p75": 22791.1,
+              "p99": 22087.7,
+              "p995": 22310.8,
+              "p999": 22310.8,
+              "sampleCount": 20,
+              "median": 20469.8,
+              "scenario": "f-initial",
+              "budgetMs": 30000,
+              "p95Ms": 21874.5,
+              "phases": {
+                "changeDetection": 1210.4,
+                "scanRedact": 4630.9,
+                "hash": 5320.2,
+                "blobWrite": 3904.1,
+                "gitCommit": 5872.3,
+                "ledgerAppend": 12.6,
+                "indexUpdate": 910.3
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
