@@ -8,6 +8,9 @@ export default defineConfig(({ mode }) => ({
     // Playwright specs (`*.spec.ts`, run by `npm run test:ui`) never match.
     include: ['**/*.test.ts'],
     exclude: [...configDefaults.exclude, 'tests/e2e/**', 'bench/**'],
+    // DEC-019(3): spawn-heavy tests (git, fsync) exceed the 5 s defaults on a loaded gate.
+    testTimeout: 30000,
+    hookTimeout: 30000,
     // `npm run bench` (mode "benchmark") exits 0 and writes an empty report ({"files": []}) until
     // the Performance Envelope scenarios exist. Benchmark mode only: `npm test` with no test files
     // still fails.
