@@ -20,8 +20,11 @@ export const HIGH_ENTROPY_MIN_LENGTH = 20;
  * Source of the candidate-token pattern: runs of base64, base64url and hex characters, plus
  * trailing base64 padding. `=` is allowed only as that padding, so `NAME=value` is judged as a
  * name and a value, not as one glued token that would swallow the variable name.
+ *
+ * Written `x{20}x*` rather than `x{20,}`: V8 keeps backtracking state per iteration of a `{n,}`
+ * loop and throws RangeError on a multi-megabyte run.
  */
-export const HIGH_ENTROPY_TOKEN_SOURCE = `[A-Za-z0-9+/_-]{${HIGH_ENTROPY_MIN_LENGTH},}={0,2}`;
+export const HIGH_ENTROPY_TOKEN_SOURCE = `[A-Za-z0-9+/_-]{${HIGH_ENTROPY_MIN_LENGTH}}[A-Za-z0-9+/_-]*={0,2}`;
 
 /** Entropy floor for tokens mixing letter case and/or digits, by token length (bits/char). */
 function mixedFloor(length: number): number {

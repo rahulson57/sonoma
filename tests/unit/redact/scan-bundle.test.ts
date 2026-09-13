@@ -113,3 +113,99 @@ describe('scanBundle', () => {
     expect(scanBytes(bytes, 10_000, 2048)).toEqual(singlePass);
   });
 });
+
+describe('scanBytes — window handover', () => {
+  // Small windows so every boundary can be swept: nominal handover at STEP, the mid-overlap
+  // handover used on long lines at STEP + MARGIN, and the first window's end at WINDOW.
+  const WINDOW = 2048;
+  const OVERLAP = 512;
+  const STEP = WINDOW - OVERLAP;
+  const MARGIN = OVERLAP / 2;
+  const SIZE = 3 * WINDOW;
+  const BOUNDARIES = [STEP, STEP + MARGIN, WINDOW];
+  const pw = ['hunter', '2', 'hunter', '2'].join(''); // low-entropy fake: detected only by its context
+  const FILLERS = [
+    { name: 'short lines', text: 'lorem ipsum dolor sit amet\n', separator: '\n' },
+    { name: 'one long line', text: 'lorem ipsum dolor sit amet ', separator: ' ' },
+  ];
+
+  /** SIZE bytes of filler with `line` at byte `at`, separated from the filler on both sides. */
+  function withLineAt(filler: (typeof FILLERS)[number], line: string, at: number): Uint8Array {
+    const body = filler.text.repeat(Math.ceil(SIZE / filler.text.length)).slice(0, SIZE);
+    return encode(body.slice(0, at - 1) + filler.separator + line + filler.separator + body.slice(at + line.length + 1));
+  }
+
+  /**
+   * Places `line` so that each boundary falls at every `stride`-th offset of it, and returns a
+   * description of every placement where the windowed scan differs from a single pass, or where the
+   * single pass does not cover `secret`.
+   */
+  function sweep(line: string, secret: string, stride: number): string[] {
+    const failures: string[] = [];
+    for (const filler of FILLERS) {
+      for (const boundary of BOUNDARIES) {
+        for (let at = boundary - line.length - 2; at <= boundary + 2; at += stride) {
+          const bytes = withLineAt(filler, line, at);
+          const single = scanBytes(bytes, 2 ** 30, 0);
+          const secretAt = at + line.indexOf(secret);
+          const covered = single.some((h) => h.offset <= secretAt && h.offset + h.length >= secretAt + secret.length);
+          if (!covered) failures.push(`${filler.name} @${at}: single pass misses the secret`);
+          if (JSON.stringify(scanBytes(bytes, WINDOW, OVERLAP)) !== JSON.stringify(single)) {
+            failures.push(`${filler.name} @${at} (boundary ${boundary}): windowed != single pass`);
+          }
+        }
+      }
+    }
+    return failures;
+  }
+
+  it.each([
+    ['NAME=value with spaces', `DB_PASSWORD=correct horse ${pw} staple`, `correct horse ${pw} staple`],
+    ['export NAME=value;rest', `export SERVICE_API_TOKEN=${pw};rest-of-token`, `${pw};rest-of-token`],
+    ['scheme://user:password@host', ['postgres', '://', 'app_user', ':', pw, '@', 'db.internal.invalid:5432/app'].join(''), pw],
+    ['"name": "escaped \\" value"', `{"client_secret": "ab\\"${pw}"}`, `ab\\"${pw}`],
+  ])('a %s secret is reported identically wherever a window boundary falls in it', (_name, line, secret) => {
+    expect(sweep(line, secret, 1)).toEqual([]);
+  });
+
+  it('at the default 8 MB / 128 KB windows, assignments and URLs cut by the handover are reported', () => {
+    const step = SCAN_WINDOW_BYTES - SCAN_OVERLAP_BYTES;
+    const bytes = Buffer.alloc(SCAN_WINDOW_BYTES + step, 'lorem ipsum dolor sit amet\n');
+    const url = ['postgres', '://', 'app_user', ':', pw, '@', 'db.internal.invalid:5432/app'].join('');
+    const placements = [
+      { line: `DB_PASSWORD=${pw}`, secret: pw, cut: 'DB_PASSWORD'.length }, // between NAME and "="
+      { line: url, secret: pw, cut: 'postgres:'.length }, // inside "://"
+      { line: `{"client_secret": "${pw}"}`, secret: pw, cut: 3 }, // inside the key
+    ].map((p, i) => ({ ...p, at: step + i * 512 - p.cut }));
+    for (const { line, at } of placements) {
+      bytes.write(`\n${line}\n`, at - 1, 'latin1');
+    }
+    const windowed = scanBytes(bytes);
+    for (const { line, secret, at } of placements) {
+      const secretAt = at + line.indexOf(secret);
+      const covered = windowed.some((h) => h.offset <= secretAt && h.offset + h.length >= secretAt + secret.length);
+      expect(covered, `${line.split(/[=:]/)[0]} not reported`).toBe(true);
+    }
+    expect(windowed).toEqual(scanBytes(bytes, 2 ** 30, 0));
+  }, 30_000);
+
+  it('a match longer than half the overlap is followed across the window end (window growth)', () => {
+    const pem = secretCorpus().find((s) => s.kind === 'pem')!.value;
+    const longValue = `${'lorem ipsum '.repeat(120)}${pw}`;
+    expect(pem.length).toBeGreaterThan(MARGIN);
+    expect(sweep(pem, pem, 17)).toEqual([]);
+    expect(sweep(`API_TOKEN=${longValue}`, longValue, 17)).toEqual([]);
+  });
+
+  it('covers a secret-named value longer than the largest window to the end of its line', () => {
+    const value = `${'lorem ipsum '.repeat(2000)}${pw}`; // ~24 KB on one line; the largest window is 8 KB
+    const github = secretCorpus().find((s) => s.kind === 'github')!.value;
+    const text = `first line\nAPI_TOKEN=${value}\n${'x '.repeat(3000)}${github}\n`;
+    const bytes = encode(text);
+    const hits = scanBytes(bytes, 1024, 256);
+    const valueStart = text.indexOf(value);
+    expect(hits.some((h) => h.offset <= valueStart && h.offset + h.length >= valueStart + value.length)).toBe(true);
+    expect(hits.some((h) => h.kind === 'github' && h.offset === text.indexOf(github))).toBe(true);
+    expect(hits).toEqual(scanBytes(bytes, 2 ** 30, 0));
+  });
+});

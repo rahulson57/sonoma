@@ -1,21 +1,56 @@
-import { detectSecrets } from './detectors.js';
+import { findSecretCandidates, mergeSecretSpans, type SecretCandidate } from './detectors.js';
 import { fingerprint } from './fingerprint.js';
 import { isExcludedPath } from './paths.js';
 import type { RedactionHit } from './sanitize.js';
 
 /** Scan window. Files are scanned in overlapping windows so a 1 GB file never becomes one string. */
 export const SCAN_WINDOW_BYTES = 8 * 1024 * 1024;
-/** Window overlap: longer than any bounded detector match (PEM blocks are searched up to 64 KB). */
+/** Window overlap. Every match is judged with at least half of it as context on each side. */
 export const SCAN_OVERLAP_BYTES = 128 * 1024;
+/** A window with a decision cut off by its end is re-scanned at double length, up to this factor. */
+export const SCAN_MAX_GROWTH = 8;
+
+const LF = 0x0a;
+const CR = 0x0d;
+
+/**
+ * Where the next window starts, and so the first match start it is responsible for. The handover is
+ * at the first line start in the first half of the overlap. Every detector except PEM matches within
+ * one line, so a window that starts at a line start sees each line exactly as a single pass does.
+ * On a longer line the handover is at the middle of the overlap instead, which leaves half an
+ * overlap of context before it.
+ */
+function handover(buffer: Buffer, nominal: number, margin: number): { start: number; ownFrom: number } {
+  const lf = buffer.subarray(nominal, nominal + margin).indexOf(LF);
+  return lf === -1 ? { start: nominal, ownFrom: nominal + margin } : { start: nominal + lf + 1, ownFrom: nominal + lf + 1 };
+}
+
+/** Offset of the first CR or LF at or after `from`, or the buffer length. */
+function lineBreakFrom(buffer: Buffer, from: number): number {
+  const lf = buffer.indexOf(LF, from);
+  const cr = buffer.indexOf(CR, from);
+  if (lf === -1) return cr === -1 ? buffer.byteLength : cr;
+  return cr === -1 ? lf : Math.min(lf, cr);
+}
 
 /**
  * All secret spans in `bytes`, as byte offsets. Bytes are read as latin1 (one char per byte), so
  * offsets are exact byte positions and ASCII credentials are detected wherever they sit, including
  * inside otherwise binary content.
  *
- * A span is owned by the window it STARTS in, outside that window's trailing overlap (the next
- * window re-finds it whole). A span that runs past its window's end is joined with its continuation
- * from the next window.
+ * The result matches a single `detectSecrets()` pass over the whole file:
+ * - A match belongs to the window its MATCH starts in (the NAME or scheme, not the value or
+ *   password), within that window's share of the file (see `handover`). Every window judges its
+ *   own matches with at least half an overlap of context before and after them.
+ * - When a window's own decision reads to the window end (a match that long, or a PEM header whose
+ *   END search runs past it), the window is re-scanned at double length, up to SCAN_MAX_GROWTH
+ *   times. If that is still not enough, the match is treated as a secret up to the end of its line,
+ *   and scanning resumes on the next line.
+ *
+ * Known limits, both far past any real credential: a match on a line longer than half an overlap
+ * that starts right after a handover may be judged without its full line; and a PEM block that
+ * begins on a line longer than SCAN_MAX_GROWTH windows is only covered by the high-entropy
+ * detector past that line.
  */
 export function scanBytes(
   bytes: Uint8Array,
@@ -26,31 +61,54 @@ export function scanBytes(
     throw new RangeError('scanBytes: windowBytes must exceed twice overlapBytes');
   }
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const size = buffer.byteLength;
+  if (size > windowBytes && overlapBytes < 2) {
+    throw new RangeError('scanBytes: overlapBytes must be at least 2 when the input spans several windows');
+  }
   const step = windowBytes - overlapBytes;
-  const ranges: Array<{ kind: string; start: number; end: number }> = [];
+  const margin = Math.floor(overlapBytes / 2);
+  const candidates: SecretCandidate[] = [];
 
-  for (let windowStart = 0; windowStart < buffer.byteLength; windowStart += step) {
-    const windowEnd = Math.min(buffer.byteLength, windowStart + windowBytes);
-    const isLastWindow = windowEnd === buffer.byteLength;
-    for (const span of detectSecrets(buffer.toString('latin1', windowStart, windowEnd))) {
-      if (!isLastWindow && span.start >= step) continue;
-      const start = windowStart + span.start;
-      const end = windowStart + span.end;
-      const previous = ranges[ranges.length - 1];
-      if (previous && start < previous.end) {
-        if (end > previous.end) previous.end = end;
-      } else {
-        ranges.push({ kind: span.kind, start, end });
+  let start = 0;
+  let ownFrom = 0;
+  while (start < size) {
+    const next = handover(buffer, start + step, margin);
+    for (let length = windowBytes; ; length *= 2) {
+      const end = Math.min(size, start + length);
+      const atEof = end === size;
+      const ownTo = atEof ? size : next.ownFrom;
+      const windowStart = start;
+      const owns = (anchor: number) => windowStart + anchor >= ownFrom && windowStart + anchor < ownTo;
+
+      const { found, cut } = findSecretCandidates(buffer.toString('latin1', start, end));
+      const cutOwn = atEof ? [] : cut.filter((c) => owns(c.anchor));
+      if (cutOwn.length > 0 && length < windowBytes * SCAN_MAX_GROWTH) continue;
+
+      for (const c of found) {
+        if (owns(c.anchor)) candidates.push({ ...c, anchor: start + c.anchor, start: start + c.start, end: start + c.end });
       }
+      if (atEof) {
+        start = size;
+      } else if (cutOwn.length > 0) {
+        const lineEnd = lineBreakFrom(buffer, end);
+        for (const c of cutOwn) {
+          candidates.push({ kind: c.kind, rank: c.rank, anchor: start + c.anchor, start: start + c.start, end: lineEnd });
+        }
+        start = lineEnd + 1;
+        ownFrom = start;
+      } else {
+        start = next.start;
+        ownFrom = next.ownFrom;
+      }
+      break;
     }
-    if (isLastWindow) break;
   }
 
-  return ranges.map(({ kind, start, end }) => ({
+  return mergeSecretSpans(candidates).map(({ kind, start: offset, end }) => ({
     kind,
-    offset: start,
-    length: end - start,
-    fingerprint: fingerprint(buffer.subarray(start, end)),
+    offset,
+    length: end - offset,
+    fingerprint: fingerprint(buffer.subarray(offset, end)),
   }));
 }
 

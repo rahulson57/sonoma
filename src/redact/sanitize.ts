@@ -25,7 +25,8 @@ const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
 /**
  * Detect and redact secrets in a tool request, stdout, stderr or any other text capture, BEFORE it
  * is hashed or persisted (SPEC-003 invariant). Every detected span is replaced by
- * `[REDACTED:<kind>]`; overlapping detections are merged, so no fragment of a secret survives.
+ * `[REDACTED:<kind>]`; overlapping detections are merged into one span, so no part of any detection
+ * survives.
  *
  * Bytes are decoded as UTF-8 (invalid sequences become U+FFFD), so this is for text. Detection is
  * best-effort: false positives are expected and accepted, and a clean result is not a guarantee.

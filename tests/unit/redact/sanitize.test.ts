@@ -115,6 +115,80 @@ describe('sanitize — detection beyond the fixed corpus', () => {
     }
   });
 
+  it('redacts the WHOLE value of a secret-named assignment: punctuation, spaces and escaped quotes included', () => {
+    const pw = ['hunter', '2', 'hunter', '2'].join(''); // low-entropy fake: only the name marks it
+    const punctuated = ['Xy7', '(k9;Lm2', ',pQ>'].join('');
+    const marker = '[REDACTED:env_assignment]';
+    const cases: Array<[input: string, expected: string]> = [
+      [`DB_PASSWORD=${punctuated}`, `DB_PASSWORD=${marker}`],
+      [`export API_TOKEN=${pw};rest-of-token`, `export API_TOKEN=${marker}`],
+      [`{"password": "ab\\"${pw}"}`, `{"password": "${marker}"}`],
+      ['DB_PASSWORD=correct horse battery staple', `DB_PASSWORD=${marker}`],
+      [`password: '${pw}\\'s rest'`, `password: '${marker}'`],
+      // A JSON config inside a JSON tool request: the key and value are JSON-escaped.
+      [
+        JSON.stringify({ content: JSON.stringify({ api_key: `ab"${pw}`, user: 'bob' }) }),
+        JSON.stringify({ content: JSON.stringify({ api_key: marker, user: 'bob' }) }),
+      ],
+      // A bare JSON literal is the whole value; the rest of the object stays readable.
+      [`{"db_password": 123456, "user": "bob"}`, `{"db_password": ${marker}, "user": "bob"}`],
+    ];
+    for (const [index, [input, expected]] of cases.entries()) {
+      expect(sanitize(input).output, `case #${index}`).toBe(expected);
+    }
+  });
+
+  it('is idempotent when a redaction marker is followed by punctuation', () => {
+    const pw = ['hunter', '2', 'hunter', '2'].join('');
+    const pem = secretCorpus().find((s) => s.kind === 'pem')!.value;
+    for (const [index, input] of [
+      `API_TOKEN="${pw}";echo ok`,
+      `{"client_secret": "${pw}", "retries": 3}`,
+      `export API_TOKEN=${pw};rest-of-token`,
+      `PRIVATE_KEY=${pem};tail`,
+      `OPTS=--password=${pw} --verbose`,
+    ].entries()) {
+      const once = sanitize(input);
+      expect(once.hits.length, `case #${index}`).toBeGreaterThan(0);
+      expect(sanitize(once.output), `case #${index}`).toEqual({ output: once.output, hits: [] });
+    }
+    const alreadyRedacted = 'API_TOKEN=[REDACTED:env_assignment];x';
+    expect(sanitize(alreadyRedacted)).toEqual({ output: alreadyRedacted, hits: [] });
+  });
+
+  it('redacts a credentialed URL password that itself contains "@"', () => {
+    const pw = ['pa', 'ss', 'word'].join('@'); // low-entropy fake
+    const prefix = ['mysql', '://', 'root', ':'].join('');
+    const { output } = sanitize(`connecting to ${prefix}${pw}@127.0.0.1:3306/app now`);
+    expect(output).toBe(`connecting to ${prefix}[REDACTED:db_url]@127.0.0.1:3306/app now`);
+  });
+
+  it('scans a run of PEM BEGIN lines that have no END line in linear time', () => {
+    const header = `${['-----BEGIN ', 'PRIVATE', ' KEY-----'].join('')}\n`;
+    const text = header.repeat(Math.floor((2 * 1024 * 1024) / header.length)); // 2 MB
+    const started = performance.now();
+    const { output } = sanitize(text);
+    // Quadratic (a 64 KB END search per header) took ~30 s here; linear takes well under a second.
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(output).not.toContain('PRIVATE KEY');
+  }, 30_000);
+
+  it('scans a long line of URLs without credentials in linear time', () => {
+    const text = ['http', '://', 'host', ':8080/x,'].join('').repeat(Math.floor((1024 * 1024) / 19)); // 1 MB, one line
+    const started = performance.now();
+    expect(sanitize(text).hits).toEqual([]);
+    // Quadratic (each URL searched for "@" to the end of the line) took ~60 s here.
+    expect(performance.now() - started).toBeLessThan(5_000);
+  }, 60_000);
+
+  it('does not throw on a multi-megabyte token or quoted secret value on one line', () => {
+    // V8 throws RangeError on a `{n,}` or alternation loop over a run of a few megabytes.
+    const run = randomChars(seededRng(0x9b10b), ALPHABET.base64, 9 * 1024 * 1024);
+    expect(sanitize(`blob ${run} end`).output).toBe('blob [REDACTED:high_entropy] end');
+    const escaped = ['ab', '\\"'].join('').repeat(3 * 1024 * 1024);
+    expect(sanitize(`API_TOKEN="${escaped}" ok`).output).toBe('API_TOKEN="[REDACTED:env_assignment]" ok');
+  }, 60_000);
+
   it('keeps a non-secret assignment readable', () => {
     expect(sanitize('NODE_ENV=production LOG_LEVEL=debug').hits).toEqual([]);
   });

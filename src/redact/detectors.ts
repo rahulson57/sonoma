@@ -5,6 +5,11 @@
  *
  * Patterns that would read as a credential are assembled from fragments, so this file never
  * contains a credential-shaped literal (it would trip repository secret scanning).
+ *
+ * Unbounded repeats are written `x{n}x*`, never `x{n,}`, and never as a repeated alternation: V8
+ * keeps backtracking state for every iteration of those loops and throws RangeError on a run of a
+ * few megabytes (a base64 blob on one line). Quoted values and URL passwords are read with linear
+ * character scans for the same reason.
  */
 import { HIGH_ENTROPY_TOKEN_SOURCE, isHighEntropyToken } from './entropy.js';
 import { isSecretEnvName } from './envNames.js';
@@ -16,36 +21,177 @@ export interface SecretSpan {
   end: number;
 }
 
+/**
+ * One detector decision, before overlapping spans are merged.
+ * - `anchor`: where the underlying match starts. For env_assignment and db_url that is the NAME or
+ *   scheme, BEFORE the span (which is only the value or password).
+ * - `rank`: detector precedence; lower wins when spans are merged.
+ */
+export interface SecretCandidate extends SecretSpan {
+  rank: number;
+  anchor: number;
+}
+
+/**
+ * A decision (accepted or rejected) that looked all the way to the end of the scanned text, so it
+ * could change if the text went on. `start` is the span start when accepted, else the anchor.
+ */
+export interface CutCandidate {
+  kind: string;
+  rank: number;
+  anchor: number;
+  start: number;
+}
+
+type Selection =
+  | { start: number; end: number; resumeAt?: number; decidedEnd?: number }
+  | { reject: true; resumeAt: number; decidedEnd?: number };
+
 interface Detector {
   kind: string;
   /** Must carry the `g` and `d` flags. */
   pattern: RegExp;
-  /** Resolve the secret span of a match, or null to reject it and resume scanning at `resumeAt`. */
-  select(match: RegExpExecArray): { start: number; end: number } | { reject: true; resumeAt: number };
+  /**
+   * Resolve the secret span of a match, or reject it. `resumeAt` is where scanning continues
+   * (default: the match end). `decidedEnd` is how far into the text the decision looked (default:
+   * the later of the match end and `resumeAt`).
+   */
+  select(match: RegExpExecArray, text: string): Selection;
 }
 
 const DASHES = '-----';
 const PRIVATE_KEY = ['PRIVATE', 'KEY'].join(' ');
+const PEM_BEGIN = `${DASHES}BEGIN `;
 /** Longest PEM body searched for a matching END line before falling back to the base64 run. */
 const PEM_MAX_BODY = 65_536;
 
 /** The whole match is the secret. */
 const wholeMatch = (match: RegExpExecArray) => ({ start: match.index, end: match.index + match[0].length });
 
-/** The first participating capture group among `groups` is the secret. */
-function firstGroup(groups: number[]) {
-  return (match: RegExpExecArray) => {
-    for (const group of groups) {
-      const range = match.indices?.[group];
-      if (range) return { start: range[0], end: range[1] };
-    }
-    return wholeMatch(match);
-  };
-}
-
 /** Alphanumeric look-around used instead of `\b`, so `MY_TOKEN_ghp...`-style glue is still caught. */
 const NOT_AFTER_ALNUM = '(?<![A-Za-z0-9])';
 const NOT_BEFORE_ALNUM = '(?![A-Za-z0-9])';
+
+function execAt(pattern: RegExp, text: string, at: number): RegExpExecArray | null {
+  pattern.lastIndex = at;
+  return pattern.exec(text);
+}
+
+/** True at the end of the text or of a line. */
+function atLineEnd(text: string, index: number): boolean {
+  return index >= text.length || text[index] === '\r' || text[index] === '\n';
+}
+
+// ---- Credentialed URL passwords ------------------------------------------------------------------
+
+/** Password characters up to the next "@" (or the end of the run). */
+const PASSWORD_RUN = /[^\s'"<>@]*/y;
+const HOST_RUN = /[^\s@/?#'"<>]*/y;
+
+/**
+ * The password of a credentialed URL whose prefix (`scheme://user:`) ends at `at`. The password runs
+ * to the first "@" whose host is not followed by another "@", so a raw "@" inside a password is
+ * covered. When no "@" in the run qualifies, no URL starting inside the same run can have a password
+ * either (it would search a suffix of the same run), so scanning resumes after the run. That keeps a
+ * long line full of URLs linear.
+ */
+function readUrlPassword(text: string, at: number): Selection {
+  if (atLineEnd(text, at) || /[\s'"<>]/.test(text[at]!)) return { reject: true, resumeAt: at };
+  for (let cursor = at + 1; ; ) {
+    cursor += execAt(PASSWORD_RUN, text, cursor)![0].length;
+    if (text[cursor] !== '@') return { reject: true, resumeAt: cursor };
+    const hostEnd = cursor + 1 + execAt(HOST_RUN, text, cursor + 1)![0].length;
+    if (text[hostEnd] !== '@') return { start: at, end: cursor, resumeAt: hostEnd };
+    cursor = hostEnd;
+  }
+}
+
+// ---- Secret-named assignment values --------------------------------------------------------------
+
+/** A value that already starts with a redaction marker was redacted by an earlier pass. */
+const MARKER_AT = /\[REDACTED:[a-z_]+\]/y;
+const DOUBLE_QUOTE_STOPS = /["\\\r\n]/g;
+const SINGLE_QUOTE_STOPS = /['\\\r\n]/g;
+/** A quoted value ends the value only when the quote is followed by a delimiter. */
+const AFTER_QUOTED = /[\s,;:)}\]&|<>#\\]|$/y;
+/** A bare JSON literal after a quoted key: `"pin": 1234,`. It cannot contain `,` `}` `]`. */
+const JSON_LITERAL = /(-?\d[\d.eE+-]*|true|false|null)[ \t]*(?=[,}\]\r\n]|\\[nrt]|$)/y;
+/** Any other value runs to the end of its line (trailing whitespace excluded). */
+const BARE_VALUE = /\S(?:[^\r\n]*\S)?/y;
+const REST_OF_LINE = /[^\r\n]*/y;
+
+/**
+ * Index just past the closing quote of the "…" or '…' value at `at` (backslash escapes honoured),
+ * or -1 when it is not closed on its line.
+ */
+function closingQuote(text: string, at: number): number {
+  const quote = text[at];
+  const stops = quote === '"' ? DOUBLE_QUOTE_STOPS : SINGLE_QUOTE_STOPS;
+  for (let cursor = at + 1; ; ) {
+    const stop = execAt(stops, text, cursor)?.index ?? -1;
+    if (stop === -1) return -1;
+    if (text[stop] === quote) return stop + 1;
+    if (text[stop] !== '\\' || atLineEnd(text, stop + 1)) return -1;
+    cursor = stop + 2;
+  }
+}
+
+/**
+ * Index just past the closing \" of a JSON string inside a JSON string (a config file in a tool
+ * request) whose opening \" is at `at`, or -1. Inside it, the inner string's own escapes read
+ * \\\" (quote), \\\\ (backslash) and \\n; a raw " would close the enclosing string.
+ */
+function closingEscapedQuote(text: string, at: number): number {
+  for (let cursor = at + 2; ; ) {
+    const stop = execAt(DOUBLE_QUOTE_STOPS, text, cursor)?.index ?? -1;
+    if (stop === -1 || text[stop] !== '\\') return -1;
+    const next = text[stop + 1];
+    if (next === '"') return stop + 2;
+    if (next !== '\\') {
+      if (atLineEnd(text, stop + 1)) return -1;
+      cursor = stop + 2; // \n, \t, \/ …: one character of the inner string
+    } else if (text[stop + 2] === '\\') {
+      if (atLineEnd(text, stop + 3)) return -1;
+      cursor = stop + 4; // \\\" or \\\\: an escaped quote or backslash of the inner string
+    } else {
+      if (atLineEnd(text, stop + 2) || text[stop + 2] === '"') return -1;
+      cursor = stop + 3; // \\n: an escape sequence of the inner string
+    }
+  }
+}
+
+/**
+ * The value of a secret-named assignment starting at `at`. Quoted values (including JSON-escaped
+ * ones) are taken whole up to their closing quote, escapes honoured. A bare JSON literal after a
+ * quoted key is taken alone. Anything else, including an unterminated quote, runs to the end of the
+ * line: generated passwords contain punctuation and passphrases contain spaces, and cutting either
+ * would leave the rest of the secret in the output.
+ */
+function readSecretValue(text: string, at: number, afterQuotedKey: boolean): Selection {
+  const marker = execAt(MARKER_AT, text, at);
+  if (marker) return { reject: true, resumeAt: at + marker[0].length };
+
+  const quote = text.startsWith('\\"', at) ? 2 : text[at] === '"' || text[at] === "'" ? 1 : 0;
+  if (quote > 0) {
+    const end = quote === 2 ? closingEscapedQuote(text, at) : closingQuote(text, at);
+    if (end !== -1 && execAt(AFTER_QUOTED, text, end)) {
+      if (end - at === 2 * quote) return { reject: true, resumeAt: end }; // empty value
+      return { start: at + quote, end: end - quote, resumeAt: end, decidedEnd: end + 1 };
+    }
+  } else if (afterQuotedKey) {
+    const literal = execAt(JSON_LITERAL, text, at);
+    if (literal) {
+      const end = at + literal[0].length;
+      return { start: at, end: at + (literal[1] ?? '').length, resumeAt: end, decidedEnd: end + 2 };
+    }
+  }
+
+  const bare = execAt(BARE_VALUE, text, at);
+  if (!bare) return { reject: true, resumeAt: at };
+  const end = at + bare[0].length;
+  const lineEnd = end + (execAt(REST_OF_LINE, text, end)?.[0].length ?? 0);
+  return { start: at, end, resumeAt: lineEnd, decidedEnd: lineEnd };
+}
 
 /**
  * Ordered by precedence: when two detectors report the same span, the earlier (more specific)
@@ -54,13 +200,27 @@ const NOT_BEFORE_ALNUM = '(?![A-Za-z0-9])';
 const DETECTORS: readonly Detector[] = [
   {
     kind: 'pem',
-    // A complete BEGIN…END private key block, or (truncated output) BEGIN plus the base64 run after it.
+    // A complete BEGIN…END private key block, or (truncated output) BEGIN plus the base64 run after
+    // it. The END search never runs past another BEGIN line, so a run of BEGIN lines with no END
+    // (grep output) is scanned once, not once per line.
     pattern: new RegExp(
-      `${DASHES}BEGIN ([A-Z0-9 ]*)${PRIVATE_KEY}( BLOCK)?${DASHES}` +
-        `(?:[\\s\\S]{0,${PEM_MAX_BODY}}?${DASHES}END \\1${PRIVATE_KEY}\\2${DASHES}|[A-Za-z0-9+/=\\r\\n\\\\]*)`,
+      `${PEM_BEGIN}([A-Z0-9 ]*)${PRIVATE_KEY}( BLOCK)?${DASHES}` +
+        `(?:((?:[^-]|-(?!${PEM_BEGIN.slice(1)})){0,${PEM_MAX_BODY}}?${DASHES}END \\1${PRIVATE_KEY}\\2${DASHES})` +
+        `|[A-Za-z0-9+/=\\r\\n\\\\]*)`,
       'gd',
     ),
-    select: wholeMatch,
+    select(match, text) {
+      const end = match.index + match[0].length;
+      if (match[3] !== undefined) return { start: match.index, end };
+      // No END line: that decision read up to PEM_MAX_BODY characters past the header, or up to the
+      // next BEGIN line.
+      const label = `${match[1] ?? ''}${PRIVATE_KEY}${match[2] ?? ''}`;
+      const headerEnd = match.index + PEM_BEGIN.length + label.length + DASHES.length;
+      let horizon = headerEnd + PEM_MAX_BODY + `${DASHES}END ${label}${DASHES}`.length;
+      const nextBegin = text.indexOf(PEM_BEGIN, headerEnd);
+      if (nextBegin !== -1) horizon = Math.min(horizon, nextBegin + PEM_BEGIN.length);
+      return { start: match.index, end, decidedEnd: Math.max(end, horizon) };
+    },
   },
   {
     kind: 'aws',
@@ -84,7 +244,7 @@ const DETECTORS: readonly Detector[] = [
     kind: 'slack',
     // Bot/user/app tokens and incoming-webhook URLs.
     pattern: new RegExp(
-      `${NOT_AFTER_ALNUM}(?:${'xo'}x[abposre]-[A-Za-z0-9-]{10,250}|${'xa'}pp-[0-9]-[A-Za-z0-9-]{10,250}|https://hooks\\.slack\\.com/services/[A-Za-z0-9/_-]{20,})`,
+      `${NOT_AFTER_ALNUM}(?:${'xo'}x[abposre]-[A-Za-z0-9-]{10,250}|${'xa'}pp-[0-9]-[A-Za-z0-9-]{10,250}|https://hooks\\.slack\\.com/services/[A-Za-z0-9/_-]{20}[A-Za-z0-9/_-]*)`,
       'gd',
     ),
     select: wholeMatch,
@@ -92,31 +252,31 @@ const DETECTORS: readonly Detector[] = [
   {
     kind: 'jwt',
     // header.payload.signature; the header is base64url JSON, so it starts `eyJ`. Signature may be empty.
-    pattern: new RegExp(`(?<![A-Za-z0-9_-])${'ey'}J[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*`, 'gd'),
+    pattern: new RegExp(
+      `(?<![A-Za-z0-9_-])${'ey'}J[A-Za-z0-9_-]{8}[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]{8}[A-Za-z0-9_-]*\\.[A-Za-z0-9_-]*`,
+      'gd',
+    ),
     select: wholeMatch,
   },
   {
     kind: 'db_url',
     // A URL carrying credentials: scheme, "://", optional user, ":", password, "@", host (any
-    // scheme). Only the password is redacted,
-    // so the host and database stay readable.
-    pattern: /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,30}:\/\/[^\s:/?#@'"<>]*:([^\s@'"<>]+)@/dg,
-    select: firstGroup([1]),
+    // scheme). Only the password is redacted, so the host and database stay readable. The pattern
+    // finds the prefix; readUrlPassword reads the password and host.
+    pattern: /(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,30}:\/\/[^\s:/?#@'"<>]*:/dg,
+    select: (match, text) => readUrlPassword(text, match.index + match[0].length),
   },
   {
     kind: 'env_assignment',
-    // NAME=value, NAME: value, "name": "value" where NAME is secret-named. Quoted values are taken
-    // whole (spaces included); bare values run to whitespace or punctuation.
-    pattern:
-      /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.-]{0,100})["']?[ \t]*[:=][ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"'`,;{}()[\]<>]+))/dg,
-    select(match) {
-      const valueRange = match.indices?.[2] ?? match.indices?.[3] ?? match.indices?.[4];
-      const name = match[1] ?? '';
-      if (!valueRange) return { reject: true, resumeAt: match.index + 1 };
-      // A rejected name may still have a secret assignment nested inside its value
-      // (`OPTS=--password=...`), so resume at the value instead of skipping past it.
-      if (!isSecretEnvName(name)) return { reject: true, resumeAt: valueRange[0] };
-      return { start: valueRange[0], end: valueRange[1] };
+    // NAME=value, NAME: value, "name": "value" and JSON-escaped \"name\": \"value\", where NAME is
+    // secret-named. The name is judged before the value is read (see readSecretValue), so a
+    // non-secret assignment costs nothing, and scanning resumes at its value because a secret
+    // assignment may be nested inside it (`OPTS=--password=...`).
+    pattern: /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.-]{0,100})(\\?["'])?[ \t]*([:=])[ \t]*/dg,
+    select(match, text) {
+      const valueStart = match.index + match[0].length;
+      if (!isSecretEnvName(match[1] ?? '')) return { reject: true, resumeAt: valueStart };
+      return readSecretValue(text, valueStart, match[2] !== undefined && match[3] === ':');
     },
   },
   {
@@ -143,35 +303,43 @@ export function isRedactionMarker(text: string): boolean {
 }
 
 /**
- * All secret spans in `text`, sorted by start, with overlapping spans merged into one (so no part
- * of an overlapping secret survives redaction). A merged span keeps the kind of its earliest,
- * longest, highest-precedence member.
- *
- * A span that is exactly a redaction marker is already-redacted content and is not reported
- * again, so sanitizing sanitized output is a no-op.
+ * Every detector decision over `text`, unmerged, plus the decisions that read to the end of `text`
+ * (`cut`). A span that is exactly a redaction marker is already-redacted content and is not
+ * reported again, so sanitizing sanitized output is a no-op.
  */
-export function detectSecrets(text: string): SecretSpan[] {
-  const found: Array<SecretSpan & { rank: number }> = [];
+export function findSecretCandidates(text: string): { found: SecretCandidate[]; cut: CutCandidate[] } {
+  const found: SecretCandidate[] = [];
+  const cut: CutCandidate[] = [];
   DETECTORS.forEach((detector, rank) => {
     const { pattern } = detector;
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
-      const selected = detector.select(match);
-      if ('reject' in selected) {
-        pattern.lastIndex = Math.max(selected.resumeAt, match.index + 1);
-        continue;
+      const matchEnd = match.index + match[0].length;
+      const selected = detector.select(match, text);
+      const resumeAt = Math.max(selected.resumeAt ?? matchEnd, match.index + 1);
+      const accepted = 'reject' in selected ? null : selected;
+      if ((selected.decidedEnd ?? Math.max(matchEnd, resumeAt)) >= text.length) {
+        cut.push({ kind: detector.kind, rank, anchor: match.index, start: accepted ? accepted.start : match.index });
       }
-      if (selected.end > selected.start && !isRedactionMarker(text.slice(selected.start, selected.end))) {
-        found.push({ kind: detector.kind, start: selected.start, end: selected.end, rank });
+      if (accepted && accepted.end > accepted.start && !isRedactionMarker(text.slice(accepted.start, accepted.end))) {
+        found.push({ kind: detector.kind, rank, anchor: match.index, start: accepted.start, end: accepted.end });
       }
-      if (match[0].length === 0) pattern.lastIndex++;
+      pattern.lastIndex = resumeAt;
     }
   });
+  return { found, cut };
+}
 
-  found.sort((a, b) => a.start - b.start || b.end - a.end || a.rank - b.rank);
+/**
+ * Sorts candidates by start and merges overlapping ones into one span (so no part of an overlapping
+ * detection survives redaction). A merged span keeps the kind of its earliest, longest,
+ * highest-precedence member. Sorts `candidates` in place.
+ */
+export function mergeSecretSpans(candidates: SecretCandidate[]): SecretSpan[] {
+  candidates.sort((a, b) => a.start - b.start || b.end - a.end || a.rank - b.rank);
   const merged: SecretSpan[] = [];
-  for (const span of found) {
+  for (const span of candidates) {
     const last = merged[merged.length - 1];
     if (last && span.start < last.end) {
       if (span.end > last.end) last.end = span.end;
@@ -180,4 +348,9 @@ export function detectSecrets(text: string): SecretSpan[] {
     }
   }
   return merged;
+}
+
+/** All secret spans in `text`, sorted by start, with overlapping spans merged into one. */
+export function detectSecrets(text: string): SecretSpan[] {
+  return mergeSecretSpans(findSecretCandidates(text).found);
 }
