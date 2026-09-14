@@ -31,6 +31,7 @@ import { stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { derivePendingIntent } from '../ledger/pending-intent.js';
+import { pendingIntentAt } from './resume-intent.js';
 import { verifyChain } from '../ledger/verify-chain.js';
 import type { Checkpoint, LedgerEvent, LedgerEventDraft, Run, SideEffect } from '../model/types.js';
 import { sanitize } from '../redact/index.js';
@@ -300,7 +301,8 @@ export class CheckpointEngine {
 
   /**
    * Check the checkpoint's workspace out into the run's execution worktree, load its state, recompute pending
-   * intent from ledger acknowledgements, and emit `agent.resumed`. Never replays the transcript.
+   * intent from ledger acknowledgements as of the checkpoint's cursor (DEC-025, see resume-intent.ts), and
+   * emit `agent.resumed`. Never replays the transcript.
    */
   async resume(ref: CheckpointRef): Promise<RestoredCheckpoint> {
     const at = toStorageRef(ref);
@@ -317,7 +319,8 @@ export class CheckpointEngine {
       await this.#git.materialize(worktreePath, checkpoint.workspace_commit);
 
       const view = await this.#view(at.run_id);
-      const pendingIntent = derivePendingIntent(view.intentEvents);
+      // As of the checkpoint's cursor, plus later requests that were never resolved (DEC-025).
+      const pendingIntent = pendingIntentAt(view.intentEvents, checkpoint.ledger_seq);
       const event = await this.#backend.appendEvent(at.run_id, { type: 'agent.resumed', actor: 'runtime', payload });
       this.#fold(view, event);
       return { checkpoint, state, worktreePath, pendingIntent };

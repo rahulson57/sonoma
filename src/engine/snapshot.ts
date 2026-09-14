@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+// S02 internals, used ONLY inside redactContent() (DEC-026, interim).
 import { scanBytes } from '../redact/bundle.js';
 import { redactionMarker } from '../redact/detectors.js';
 import { isExcludedPath, sanitize } from '../redact/index.js';
@@ -102,7 +103,15 @@ export function gitBlobId(bytes: Uint8Array, format: ObjectFormat): string {
   return createHash(format).update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
 }
 
-/** Redact `raw` (file content or a symlink target). Returns `raw` itself when nothing was found. */
+/**
+ * Redact `raw` (file content or a symlink target). Returns `raw` itself when nothing was found.
+ *
+ * DEC-026 (INTERIM, pending the human's answer to MSG-3323 item 2): non-UTF-8 content and content over
+ * TEXT_SANITIZE_MAX_BYTES is redacted IN PLACE with S02's reviewed windowed scanner. `scanBytes` and
+ * `redactionMarker` are S02 internals, not part of the public src/redact/index.ts contract, so their use is
+ * confined to this one function. If the human instead chooses a public sanitizeBytes, or skipping
+ * secret-bearing files via `workspace.file_skipped`, only this function changes.
+ */
 export function redactContent(raw: Buffer): { bytes: Buffer; hits: number } {
   if (raw.byteLength <= TEXT_SANITIZE_MAX_BYTES && isUtf8(raw)) {
     const { output, hits } = sanitize(raw.toString('utf8'));
