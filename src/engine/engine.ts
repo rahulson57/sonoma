@@ -34,7 +34,8 @@ import path from 'node:path';
 // Type only (DEC-030): the Distiller owns DistillRequest; the engine never imports src/distill at runtime.
 import type { DistillRequest } from '../distill/index.js';
 import { verifyChain } from '../ledger/verify-chain.js';
-import type { Checkpoint, LedgerEvent, LedgerEventDraft, Run, SideEffect } from '../model/types.js';
+import type { Checkpoint, LedgerEvent, LedgerEventDraft, Run, SemanticClaim, SemanticProjection, SideEffect } from '../model/types.js';
+import { validateSemanticClaim } from '../model/validate.js';
 import { sanitize } from '../redact/index.js';
 import { STORE_DIR_NAME } from '../storage/layout.js';
 import type { StorageBackend } from '../storage/types.js';
@@ -103,6 +104,8 @@ interface RunView {
   readonly intentEvents: LedgerEvent[];
   /** Every `agent.resumed` / `agent.rolled_back`, in seq order (DEC-031). */
   readonly lineage: LineageMark[];
+  /** event_id → seq of every `state.declared` event: what a checkpoint's declaredState may cite (SPEC-010). */
+  readonly declaredEvents: Map<string, number>;
   usage: { input_tokens: number; output_tokens: number };
   cache: SnapshotCache | undefined;
 }
@@ -117,6 +120,56 @@ function invalid(message: string): EngineError {
 
 function tokenCount(value: unknown): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * SPEC-006 `declaredState` (from the State SDK, SPEC-010): shape-checks the claims and returns sanitized copies,
+ * before anything is written. A declared claim is `agent_declared` and cites only the `state.declared` event(s) its
+ * declaration was recorded as. Its value is free text from agent code, so it goes through sanitize() here whatever
+ * the caller did (SPEC-003). Errors name the claim's position, never its value.
+ */
+function declaredClaimsOf(value: unknown): SemanticClaim[] | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.length === 0) throw invalid('declaredState is a non-empty array of SemanticClaims or null');
+  return value.map((raw: unknown, i: number): SemanticClaim => {
+    const checked = validateSemanticClaim(raw);
+    if (!checked.ok) throw invalid(`declaredState[${i}] is not a valid SemanticClaim`);
+    const { field, value: text, origin, confidence, provenance } = checked.value;
+    if (origin !== 'agent_declared') throw invalid(`declaredState[${i}].origin must be agent_declared`);
+    if (
+      provenance.event_ids.length === 0 ||
+      provenance.artifact_refs.length > 0 ||
+      provenance.workspace_paths.length > 0 ||
+      provenance.checkpoint_ids.length > 0
+    ) {
+      throw invalid(`declaredState[${i}].provenance must cite only the state.declared event(s) it was recorded as`);
+    }
+    return {
+      field,
+      value: sanitize(text).output,
+      origin,
+      ...(confidence === undefined ? {} : { confidence }),
+      provenance: { event_ids: [...provenance.event_ids], artifact_refs: [], workspace_paths: [], checkpoint_ids: [] },
+    };
+  });
+}
+
+/**
+ * Every cited event must be a `state.declared` event of this run recorded after the parent checkpoint's cursor, so
+ * the claims lie inside the projection's ledgerRange and an event already covered by an earlier checkpoint cannot be
+ * cited again.
+ */
+function assertDeclaredEvents(declaredEvents: ReadonlyMap<string, number>, claims: readonly SemanticClaim[], parent: Checkpoint | null): void {
+  const from = parent === null ? 0 : parent.ledger_seq;
+  claims.forEach((claim, i) => {
+    for (const eventId of claim.provenance.event_ids) {
+      const seq = declaredEvents.get(eventId);
+      if (seq === undefined) throw invalid(`declaredState[${i}] cites an event that is not a state.declared event of this run`);
+      if (seq <= from) {
+        throw invalid(`declaredState[${i}] cites the state.declared event at seq ${seq}, at or before the parent checkpoint's cursor ${from}`);
+      }
+    }
+  });
 }
 
 export class CheckpointEngine {
@@ -234,13 +287,19 @@ export class CheckpointEngine {
   /**
    * State + sanitized workspace commit + ledger cursor, atomically (through storage). A label emits one
    * fire-and-forget `DistillRequest` after this returns; nothing here waits on, or calls, a model.
+   *
+   * `declaredState` (SPEC-006 input from the State SDK, SPEC-010) is validated against this run's `state.declared`
+   * events BEFORE anything is written. Its values are sanitized and then stored as a `source: 'declared'` projection
+   * of the new checkpoint, after the checkpoint is durable. If that write fails, this rejects. The two writes are NOT
+   * atomic; see #putDeclaredProjection.
    */
   async checkpoint(runId: string, options: CheckpointOptions = {}): Promise<Checkpoint> {
     assertRunId(runId);
-    if (!isRecord(options)) throw invalid('checkpoint options are {label?}');
+    if (!isRecord(options)) throw invalid('checkpoint options are {label?, declaredState?}');
     const rawLabel = options.label ?? null;
     if (rawLabel !== null && (typeof rawLabel !== 'string' || rawLabel === '')) throw invalid('label is a non-empty string or null');
     const label = rawLabel === null ? null : sanitize(rawLabel).output;
+    const declared = declaredClaimsOf(options.declaredState);
 
     const { created: checkpoint, parent } = await this.#serial(runId, async () => {
       const view = await this.#view(runId);
@@ -250,6 +309,7 @@ export class CheckpointEngine {
       }
       const parentId = view.currentCheckpointId;
       const parent = parentId !== null ? await this.#backend.getCheckpoint({ run_id: runId, checkpoint_id: parentId }) : null;
+      if (declared !== null) assertDeclaredEvents(view.declaredEvents, declared, parent);
       const parentCommit = parent !== null ? parent.workspace_commit : view.forkCommit;
 
       const snapshot = await buildSnapshot({
@@ -295,6 +355,7 @@ export class CheckpointEngine {
           view.currentCheckpointId = created.checkpoint_id;
         }
         view.cache = { workspaceDir, baseCommit: created.workspace_commit, files: snapshot.files };
+        if (declared !== null) await this.#putDeclaredProjection(created, parent, declared);
         return { created, parent };
       } catch (err) {
         view.cache = undefined;
@@ -460,6 +521,36 @@ export class CheckpointEngine {
     });
   }
 
+  /**
+   * Stores declared claims as the `source: 'declared'` projection of `created` (SPEC-015 amendment 3: no distiller
+   * or usage block is faked).
+   *
+   * THIS IS NOT ATOMIC WITH THE CHECKPOINT. When it runs, storage's createCheckpoint has already made the checkpoint
+   * durable (state blob, ref, `checkpoint.created`, index row). The projection is a second, separate durable write.
+   * - If it FAILS, the error propagates and checkpoint() rejects, so no caller is handed a checkpoint whose declared
+   *   claims were not stored. The checkpoint itself remains, because durable history is never deleted.
+   * - If the process DIES between the two writes, the checkpoint exists with NO declared claims. reindex() cannot
+   *   recreate them: it rebuilds from runs/, CAS and refs, and this projection never reached CAS. The declaration
+   *   survives only as its sanitized `state.declared` ledger event, and nothing turns that event back into claims.
+   */
+  async #putDeclaredProjection(created: Checkpoint, parent: Checkpoint | null, claims: readonly SemanticClaim[]): Promise<void> {
+    const projection: SemanticProjection = {
+      id: `declared_${created.run_id}_${created.checkpoint_id}`,
+      checkpointId: created.checkpoint_id,
+      source: 'declared',
+      distiller: null,
+      input: {
+        stateHash: created.state_hash,
+        ledgerRange: [parent === null ? 0 : parent.ledger_seq, created.ledger_seq],
+        workspaceCommit: created.workspace_commit,
+      },
+      claims,
+      usage: null,
+      createdAt: created.created_at,
+    };
+    await this.#backend.putProjection(projection);
+  }
+
   #workspaceOf(runId: string, view: RunView): string {
     return view.workspace === 'execution' ? this.worktreePath(runId) : this.#git.workTree;
   }
@@ -491,6 +582,7 @@ export class CheckpointEngine {
         forkCommit: null,
         intentEvents: [],
         lineage: [],
+        declaredEvents: new Map(),
         usage: { input_tokens: 0, output_tokens: 0 },
         cache: undefined,
       };
@@ -534,6 +626,9 @@ export class CheckpointEngine {
       case 'side_effect.requested':
       case 'side_effect.committed':
         view.intentEvents.push(event);
+        break;
+      case 'state.declared':
+        view.declaredEvents.set(event.event_id, event.seq);
         break;
       case 'model.responded': {
         const usage = isRecord(payload['usage']) ? payload['usage'] : payload;
