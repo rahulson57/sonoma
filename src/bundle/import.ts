@@ -4,20 +4,27 @@
  * Verification happens before the first byte is written, and covers:
  * - the tar itself (checksums, regular files only, no unsafe names) and the bundle layout: any other
  *   entry, such as refs/heads/*, rejects the bundle;
- * - every CAS blob's sha256 against its address, and every git object's sha1 against its id;
+ * - every CAS blob's sha256 against its address, and every git object's sha1 against its id plus git's own
+ *   object format check (the check `hash-object -w` applies, run without writing);
  * - every ledger line: a valid event for its run, stored exactly as sealed (canonical JSON), and the
  *   hash chain from genesis;
- * - every declared checkpoint: its ref in the bundle points at its workspace_commit, and its state blob
- *   is a valid Agent State Object for it;
+ * - every declared checkpoint: its ref in the bundle points at its workspace_commit, which is a commit
+ *   (bundled or already in this repository), and its state blob, matched by sha256 AND size, is a valid
+ *   Agent State Object for it;
  * - completeness: every blob and git object the runs need is in the bundle or already in the store;
  * - the destination: a run that exists with a different head is rejected, never overwritten. A run whose
  *   head is identical is already imported and is left alone.
  * Any mismatch aborts with nothing written.
  *
+ * Only what the imported runs use is written: git objects reachable from their refs, and CAS blobs their
+ * ledgers and checkpoints reference. Anything else a bundle carries is ignored.
+ *
  * Writes follow Local Storage's visibility order: git objects (unreachable), CAS blobs, events.jsonl,
  * refs (one atomic git transaction), and run.json last, since a run directory without run.json is
- * ignored. The index is then rebuilt with reindex(). If a write fails midway, everything this import
- * created is removed again. Git objects are the exception: they stay unreachable until git prunes them.
+ * ignored. The index is then rebuilt with reindex(). If a write fails midway, the ledgers, refs and run
+ * records this import created are removed again. Git objects and CAS blobs stay: both stores are shared and
+ * content-addressed, so another writer may already reference the same object, and an orphan is harmless
+ * (git prunes unreachable objects).
  *
  * StorageBackend has no import method, and Local Storage's durable writers are private. So this lays
  * down the same source-of-truth files under the run's lock, using storage's own layout, blob store and
@@ -38,7 +45,7 @@ import { BundleError } from './errors.js';
 import type { BundleContext } from './export.js';
 import { GIT_SHA, decodeGitObject, gitObjectId, referencedObjects, type GitObject, type GitObjectType } from './git.js';
 import { MANIFEST_ENTRY, parseEntryName, type BundleEntryKind } from './layout.js';
-import { checkpointsFromLedger, isRecord, parseCanonicalJson, parseRunRecord, runRecordText, sha256Hex } from './records.js';
+import { checkpointsFromLedger, collectBlobRefs, isRecord, parseCanonicalJson, parseRunRecord, runRecordText, sha256Hex } from './records.js';
 import { BundleFormatError, readTarEntry, readTarIndex, type TarEntry } from './tar.js';
 import { BUNDLE_SCHEMA_VERSION, type BundleManifest } from './types.js';
 
@@ -52,6 +59,10 @@ interface VerifiedRun {
   readonly ledgerBytes: Buffer;
   readonly head: LedgerHead;
   readonly refs: ReadonlyArray<{ readonly ref: string; readonly sha: string }>;
+  /** sha256 of the bundled CAS blobs this run's ledger and checkpoints reference. */
+  readonly blobs: ReadonlySet<string>;
+  /** Ids of the bundled git objects reachable from this run's refs. */
+  readonly gitObjects: ReadonlySet<string>;
 }
 
 interface VerifiedBundle {
@@ -60,6 +71,10 @@ interface VerifiedBundle {
   readonly gitObjects: ReadonlyMap<string, { readonly type: GitObjectType; readonly entry: TarEntry }>;
   readonly runs: readonly VerifiedRun[];
 }
+
+/** Git objects are format-checked in batches of at most this many content bytes or objects. */
+const CHECK_BATCH_BYTES = 64 * 1024 * 1024;
+const CHECK_BATCH_OBJECTS = 4096;
 
 const invalid = (message: string): BundleError => new BundleError('ERR_INVALID_BUNDLE', message);
 const tampered = (message: string): BundleError => new BundleError('ERR_TAMPERED', message);
@@ -167,8 +182,15 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
   if (!sameMembers([...blobs.keys()].map((sha) => `sha256:${sha}`), manifest.blobRefs)) throw invalid('objects/sha256 entries do not match manifest.json blobRefs');
   const hasBlob = async (ref: BlobRef): Promise<boolean> => blobs.get(ref.sha256)?.ref.size === ref.size || (await ctx.blobs.has(ref));
 
-  // Git objects: bytes against id.
+  // Git objects: bytes against id, then git's own format check, without writing anything.
   const gitObjects = new Map<string, { type: GitObjectType; entry: TarEntry; references: string[] }>();
+  let batch: GitObject[] = [];
+  let batchBytes = 0;
+  const checkBatch = async (): Promise<void> => {
+    await ctx.git.checkObjects(batch, ctx.layout.tmp);
+    batch = [];
+    batchBytes = 0;
+  };
   for (const { entry, kind } of named) {
     if (kind.kind !== 'git') continue;
     const bytes = await readTarEntry(handle, entry);
@@ -176,7 +198,11 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
     if (actual !== kind.sha) throw tampered(`git object ${kind.sha} does not match its id (its bytes hash to ${actual})`);
     const { type, content } = decodeGitObject(bytes);
     gitObjects.set(kind.sha, { type, entry, references: referencedObjects(type, content) });
+    batch.push({ sha: kind.sha, type, content });
+    batchBytes += content.byteLength;
+    if (batchBytes >= CHECK_BATCH_BYTES || batch.length >= CHECK_BATCH_OBJECTS) await checkBatch();
   }
+  await checkBatch();
 
   // Refs.
   const bundleRefs = new Map<string, { runId: string; sha: string }>();
@@ -196,7 +222,7 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
       throw invalid(`bundle holds content of run ${kind.runId}, which manifest.json does not list`);
     }
   }
-  const runs: VerifiedRun[] = [];
+  const drafts: Array<Omit<VerifiedRun, 'gitObjects'>> = [];
   const declaredCheckpoints: string[] = [];
   for (const runId of manifest.runIds) {
     const runEntry = index.find((entry) => entry.name === `runs/${runId}/run.json`);
@@ -212,10 +238,25 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
     const events = parseLedger(runId, ledgerBytes);
     const chain = verifyChain(events);
     if (!chain.ok) throw tampered(`ledger hash chain of ${runId} is broken at seq ${chain.brokenAtSeq}: ${chain.reason}`);
-    for (const event of events) {
-      if (event.payload_ref !== null && !(await hasBlob(event.payload_ref))) {
-        throw incomplete(`payload blob ${event.payload_ref.sha256} of ${runId}#${event.seq} is neither in the bundle nor in this store`);
+
+    // Bundled blobs this run references: payload blobs, and {sha256, size} refs inside its payloads.
+    const referenced = new Set<string>();
+    const noteBlobRefs = (value: unknown): void => {
+      for (const ref of collectBlobRefs(value).values()) {
+        if (blobs.get(ref.sha256)?.ref.size === ref.size) referenced.add(ref.sha256);
       }
+    };
+    for (const event of events) {
+      noteBlobRefs(event.payload);
+      const payloadRef = event.payload_ref;
+      if (payloadRef === null) continue;
+      if (!(await hasBlob(payloadRef))) {
+        throw incomplete(`payload blob ${payloadRef.sha256} of ${runId}#${event.seq} is neither in the bundle nor in this store`);
+      }
+      const bundled = blobs.get(payloadRef.sha256);
+      if (bundled === undefined || bundled.ref.size !== payloadRef.size) continue;
+      referenced.add(payloadRef.sha256);
+      noteBlobRefs(parseCanonicalJson(await readTarEntry(handle, bundled.entry)));
     }
 
     const refs: Array<{ ref: string; sha: string }> = [];
@@ -226,6 +267,9 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
       if (bundled.sha !== checkpoint.workspace_commit) throw tampered(`ref ${ref} does not point at the commit its checkpoint records`);
       const state = blobs.get(checkpoint.state_blob.sha256);
       if (state !== undefined) {
+        if (state.ref.size !== checkpoint.state_blob.size) {
+          throw tampered(`state blob of ${runId}/${checkpoint.checkpoint_id} is ${state.ref.size} bytes, but its checkpoint records ${checkpoint.state_blob.size}`);
+        }
         const valid = validateAgentState(parseCanonicalJson(await readTarEntry(handle, state.entry)));
         if (
           !valid.ok ||
@@ -236,6 +280,7 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
         ) {
           throw tampered(`state blob of ${runId}/${checkpoint.checkpoint_id} is not that checkpoint's state`);
         }
+        referenced.add(checkpoint.state_blob.sha256);
       } else if (!(await ctx.blobs.has(checkpoint.state_blob))) {
         throw incomplete(`state blob of ${runId}/${checkpoint.checkpoint_id} is neither in the bundle nor in this store`);
       }
@@ -246,31 +291,41 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
     if (runRefCount !== refs.length) throw invalid(`bundle holds refs of ${runId} that no checkpoint in its ledger declares`);
 
     const last = events.at(-1);
-    runs.push({ runId, runBytes, ledgerBytes, head: last === undefined ? GENESIS_HEAD : { seq: last.seq, hash: last.hash }, refs });
+    drafts.push({ runId, runBytes, ledgerBytes, head: last === undefined ? GENESIS_HEAD : { seq: last.seq, hash: last.hash }, refs, blobs: referenced });
   }
   if (!sameMembers(declaredCheckpoints, manifest.checkpointIds)) throw invalid('checkpoints declared by the ledgers do not match manifest.json checkpointIds');
 
-  // Every object the refs reach is in the bundle or already in this repository.
+  // Every object a run's refs reach is in the bundle or already in this repository.
   const external = new Set<string>();
-  const seen = new Set<string>();
-  const pending = runs.flatMap((run) => run.refs.map(({ sha }) => sha));
-  for (const run of runs) {
-    for (const { ref, sha } of run.refs) {
+  const runs: VerifiedRun[] = drafts.map((draft) => {
+    const reachable = new Set<string>();
+    const seen = new Set<string>();
+    const pending = draft.refs.map(({ sha }) => sha);
+    while (pending.length > 0) {
+      const sha = pending.pop()!;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
       const object = gitObjects.get(sha);
-      if (object !== undefined && object.type !== 'commit') throw invalid(`ref ${ref} does not point at a commit`);
+      if (object === undefined) {
+        external.add(sha);
+      } else {
+        reachable.add(sha);
+        pending.push(...object.references);
+      }
     }
-  }
-  while (pending.length > 0) {
-    const sha = pending.pop()!;
-    if (seen.has(sha)) continue;
-    seen.add(sha);
-    const object = gitObjects.get(sha);
-    if (object === undefined) external.add(sha);
-    else pending.push(...object.references);
-  }
+    return { ...draft, gitObjects: reachable };
+  });
   const present = await ctx.git.inspect([...external]);
   const missing = [...external].filter((sha) => present.get(sha) == null);
   if (missing.length > 0) throw incomplete(`bundle lacks ${missing.length} git object(s) its refs need (e.g. ${missing[0]}), and this repository does not have them`);
+
+  // Every ref points at a commit, whether the commit travels in the bundle or is already in this repository.
+  for (const run of runs) {
+    for (const { ref, sha } of run.refs) {
+      const type = gitObjects.get(sha)?.type ?? present.get(sha)?.type;
+      if (type !== 'commit') throw invalid(`ref ${ref} does not point at a commit (${sha} is a ${type ?? 'missing object'})`);
+    }
+  }
 
   return {
     manifest,
@@ -326,8 +381,9 @@ async function writeRuns(ctx: BundleContext, handle: FileHandle, bundle: Verifie
       throw new BundleError('ERR_RUN_EXISTS', 'a run of this bundle was created in the store while the bundle was being verified');
     }
 
-    // 1. Git objects the repository lacks (unreachable until step 4).
-    const shas = [...bundle.gitObjects.keys()];
+    // 1. Git objects the imported refs reach and the repository lacks (unreachable until step 4). Never
+    //    removed on rollback: see the header.
+    const shas = [...new Set(runs.flatMap((run) => [...run.gitObjects]))];
     const present = await ctx.git.inspect(shas);
     const needed: GitObject[] = [];
     for (const sha of shas) {
@@ -339,13 +395,15 @@ async function writeRuns(ctx: BundleContext, handle: FileHandle, bundle: Verifie
     }
     await ctx.git.writeObjects(needed, ctx.layout.tmp);
 
-    // 2. CAS blobs the store lacks.
-    for (const { ref, entry } of bundle.blobs.values()) {
+    // 2. CAS blobs the imported runs reference and the store lacks. Never removed on rollback: CAS is
+    //    deduplicated, so from put() on another writer's putBlob of the same bytes finds this file and
+    //    references it. Deleting it would corrupt that writer's run; an orphan blob is harmless.
+    for (const sha of new Set(runs.flatMap((run) => [...run.blobs]))) {
+      const { ref, entry } = bundle.blobs.get(sha)!;
       if (await ctx.blobs.has(ref)) continue;
       const bytes = await readTarEntry(handle, entry);
       if (sha256Hex(bytes) !== ref.sha256) throw tampered(`blob ${ref.sha256} changed after verification`);
       await ctx.blobs.put(bytes);
-      undo.push(() => unlink(ctx.blobs.pathFor(ref.sha256)));
     }
 
     // 3. Ledgers.

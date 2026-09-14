@@ -109,6 +109,9 @@ export function applyRedactions(bytes: Buffer, hits: readonly RedactionHit[]): B
   let current: { kind: string; start: number; end: number } | undefined;
   const flush = (): void => {
     if (current === undefined) return;
+    // DEC-029(3): redactionMarker comes from src/redact/detectors.js, not the public redact index, on the
+    // same interim terms as DEC-026. It is used in this one function only, so a bundle carries exactly
+    // Redaction's own marker.
     parts.push(bytes.subarray(cursor, current.start), Buffer.from(redactionMarker(current.kind), 'utf8'));
     cursor = current.end;
     current = undefined;

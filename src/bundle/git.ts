@@ -199,10 +199,23 @@ export class BundleGit {
   }
 
   /**
+   * Run git's own object format check (the one `hash-object -w` applies: tree entries, commit and tag
+   * headers) on each object WITHOUT writing it. Each must also hash to its own id. A malformed object
+   * fails with ERR_INVALID_BUNDLE.
+   */
+  checkObjects(objects: readonly GitObject[], tmpDir: string): Promise<void> {
+    return this.#hashObjects(objects, tmpDir, false);
+  }
+
+  /**
    * Write objects into the object database. Each must come back under its own id, or this fails. Objects
    * written here stay unreachable until a ref points at them.
    */
-  async writeObjects(objects: readonly GitObject[], tmpDir: string): Promise<void> {
+  writeObjects(objects: readonly GitObject[], tmpDir: string): Promise<void> {
+    return this.#hashObjects(objects, tmpDir, true);
+  }
+
+  async #hashObjects(objects: readonly GitObject[], tmpDir: string, write: boolean): Promise<void> {
     if (objects.length === 0) return;
     const work = await mkdtemp(path.join(tmpDir, 'bundle-objects-'));
     try {
@@ -215,8 +228,13 @@ export class BundleGit {
         byType.set(object.type, list);
       }
       for (const [type, list] of byType) {
-        const out = await this.#ok(['hash-object', '-w', '--no-filters', '-t', type, '--stdin-paths'], `${list.map((e) => e.file).join('\n')}\n`);
-        const shas = out.toString('utf8').split('\n').filter((line) => line !== '');
+        const args = ['hash-object', ...(write ? ['-w'] : []), '--no-filters', '-t', type, '--stdin-paths'];
+        const result = await execGit(args, this.repo.workTree, this.repo.gitDir, `${list.map((e) => e.file).join('\n')}\n`);
+        if (result.code !== 0) {
+          if (write) throw new BundleError('ERR_GIT', `git hash-object failed (exit ${result.code}): ${result.stderr.trim()}`);
+          throw new BundleError('ERR_INVALID_BUNDLE', `a bundled git ${type} object is malformed: ${result.stderr.trim()}`);
+        }
+        const shas = result.stdout.toString('utf8').split('\n').filter((line) => line !== '');
         list.forEach((entry, i) => {
           if (shas[i] !== entry.sha) {
             throw new BundleError('ERR_TAMPERED', `git object ${entry.sha} was stored as ${shas[i] ?? 'nothing'}`);

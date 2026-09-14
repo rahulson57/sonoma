@@ -10,7 +10,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { createBundleService, type BundleService, type ExportIo } from '../../../src/bundle/index.js';
-import { readTarEntry, readTarIndex } from '../../../src/bundle/tar.js';
+import type { BundleManifest } from '../../../src/bundle/types.js';
+import { TarWriter, readTarEntry, readTarIndex } from '../../../src/bundle/tar.js';
+import { canonicalJSON } from '../../../src/ledger/canonical-json.js';
+import { GENESIS_PREV_HASH, chainHash } from '../../../src/ledger/hash.js';
 import type { Checkpoint, LedgerEvent, LedgerEventType } from '../../../src/model/types.js';
 import { BlobStore, IndexDb, LocalBackend, type IndexCounts } from '../../../src/storage/index.js';
 import { fixedClock, type FixedClock } from '../../helpers/clock.js';
@@ -182,6 +185,48 @@ export async function tamperedCopy(bundlePath: string, outPath: string, entryNam
   const bytes = Buffer.from(await readFile(bundlePath));
   mutate(bytes.subarray(entry.offset, entry.offset + entry.size));
   await writeFile(outPath, bytes, { mode: 0o600 });
+}
+
+/** Copy a bundle to `outPath` with its entries edited by `edit` (entries keep their order; new ones go last). */
+export async function rewrittenCopy(bundlePath: string, outPath: string, edit: (entries: Map<string, Buffer>) => void | Promise<void>): Promise<void> {
+  const entries = await readBundle(bundlePath);
+  await edit(entries);
+  const handle = await open(outPath, 'wx', 0o600);
+  try {
+    const writer = new TarWriter(handle);
+    for (const [name, bytes] of entries) await writer.add(name, bytes);
+    await writer.finish();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Edit a bundle's manifest.json in place in `entries`. */
+export function editManifest(entries: Map<string, Buffer>, edit: (manifest: BundleManifest) => BundleManifest): void {
+  const manifest = JSON.parse(entries.get('manifest.json')!.toString('utf8')) as BundleManifest;
+  entries.set('manifest.json', Buffer.from(JSON.stringify(edit(manifest)), 'utf8'));
+}
+
+/**
+ * A ledger (events.jsonl bytes) edited by `edit`, then re-sealed: prev_hash and hash recomputed from
+ * genesis. Nothing in a chain is signed, so anyone holding a bundle can do this; import must catch what
+ * the chain cannot.
+ */
+export function resealedLedger(bytes: Buffer, edit: (events: Array<Record<string, any>>) => void): Buffer {
+  const events = bytes
+    .toString('utf8')
+    .split('\n')
+    .filter((line) => line !== '')
+    .map((line) => JSON.parse(line) as Record<string, any>);
+  edit(events);
+  let prev = GENESIS_PREV_HASH;
+  const lines = events.map((event) => {
+    const sealed: Record<string, unknown> = { ...event, prev_hash: prev };
+    sealed['hash'] = chainHash(prev, sealed);
+    prev = sealed['hash'] as string;
+    return `${canonicalJSON(sealed)}\n`;
+  });
+  return Buffer.from(lines.join(''), 'utf8');
 }
 
 export interface StoreState {

@@ -32,14 +32,28 @@ describe('redacted export', () => {
     const corpus = secretCorpus();
     const all = corpus.map((sample) => sample.value).join('\n\n');
     const byKind = (kind: string): string => corpus.find((sample) => sample.kind === kind)!.value;
+    const hex = corpus.find((sample) => sample.kind === 'high_entropy' && /^[0-9a-f]{64}$/.test(sample.value))!.value;
+    // DEC-029: the 64-hex value as a WHOLE string value at payload positions whose names are exempt
+    // elsewhere (the envelope's hash/prev_hash, a stored blob's sha256, a verified checkpoint's
+    // workspace_commit/state_hash). None of these is a verified position, so each must still be redacted.
+    const lookalikes = {
+      hash: hex,
+      prev_hash: hex,
+      sha256: hex,
+      workspace_commit: hex,
+      state_hash: hex,
+      nested: { hash: hex, prev_hash: hex, state_hash: hex },
+      unstored: { sha256: hex, size: 64 },
+    };
 
     const run = await store.backend.createRun({ agent: `claude-code ${byKind('slack')}` });
     const runId = run.run_id;
     // Tool request, stdout and stderr.
     await event(store, runId, 'tool.requested', { tool: 'bash', command: `curl -H "Authorization: Bearer ${byKind('jwt')}" ${byKind('db_url')}` });
     await event(store, runId, 'tool.completed', { stdout: all, stderr: `warning: ${byKind('aws')}\n` });
+    await event(store, runId, 'tool.completed', { stdout: 'ok', stderr: '', ...lookalikes });
     // An over-limit payload (stored as a CAS payload blob) and an artifact blob.
-    await event(store, runId, 'tool.completed', { stdout: `${'lorem ipsum dolor '.repeat(70_000)}\n${all}\n`, stderr: '' });
+    await event(store, runId, 'tool.completed', { stdout: `${'lorem ipsum dolor '.repeat(70_000)}\n${all}\n`, stderr: '', ...lookalikes });
     const artifact = await store.backend.putBlob(Buffer.from(`artifact dump\n${all}\n`, 'utf8'));
     await event(store, runId, 'tool.completed', { stdout: 'saved', stderr: '', output: artifact });
     // Workspace files in two checkpoints, and a checkpoint label.
