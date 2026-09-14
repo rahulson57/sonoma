@@ -65,8 +65,10 @@ interface Window {
   marks: Partial<Record<MarkName, number>>;
   creates: number;
   appends: number;
-  /** Backend calls other than appendEvent/createCheckpoint before the first appendEvent. */
-  callsBeforeFirstAppend: number;
+  /** getEvents calls before the first appendEvent (record()'s #view tail read is one). */
+  readsBeforeFirstAppend: number;
+  /** Backend calls other than appendEvent/getEvents/createCheckpoint before the first appendEvent. */
+  otherCallsBeforeFirstAppend: number;
 }
 
 /** Collects marks while a window is open; outside a window every mark is ignored. */
@@ -75,7 +77,7 @@ export class Probe {
 
   open(): Window {
     if (this.#window !== null) throw new Error('harness: a measured window is already open');
-    this.#window = { marks: {}, creates: 0, appends: 0, callsBeforeFirstAppend: 0 };
+    this.#window = { marks: {}, creates: 0, appends: 0, readsBeforeFirstAppend: 0, otherCallsBeforeFirstAppend: 0 };
     return this.#window;
   }
 
@@ -103,9 +105,14 @@ export class Probe {
     w.appends += 1;
   }
 
+  onRead(): void {
+    const w = this.#window;
+    if (w !== null && w.appends === 0) w.readsBeforeFirstAppend += 1;
+  }
+
   onOther(): void {
     const w = this.#window;
-    if (w !== null && w.appends === 0) w.callsBeforeFirstAppend += 1;
+    if (w !== null && w.appends === 0) w.otherCallsBeforeFirstAppend += 1;
   }
 }
 
@@ -134,7 +141,7 @@ export class ProbedBackend implements StorageBackend {
     return this.#inner.appendEvent(...a);
   }
   getEvents(...a: Parameters<SB['getEvents']>): ReturnType<SB['getEvents']> {
-    this.#probe.onOther();
+    this.#probe.onRead();
     return this.#inner.getEvents(...a);
   }
   putBlob(...a: Parameters<SB['putBlob']>): ReturnType<SB['putBlob']> {
@@ -272,11 +279,19 @@ export async function measureCheckpoint(store: Store, runId: string): Promise<Me
 
 /**
  * record() of one observation, then checkpoint(): the automatic checkpoint boundary that carries a tool output.
- * `scanRedact` = record() call → its appendEvent call: sanitizePayload plus O(1) validation and queueing, with no
- * other backend call in between (else null). It is an UPPER BOUND on scanRedact (DEC-051(2)): the window also holds
- * that O(1) validation, so the true phase is at most this value. The observation's own append (ledger + CAS offload
- * + index) is a ledger append outside the seams, so ledgerAppend and indexUpdate are null. No merged spans are
- * reported for this measurement: DEC-051(1) approves only the checkpoint spans.
+ *
+ * `scanRedact` = record() call → its appendEvent call. That window holds sanitizePayload plus O(1) validation, the
+ * per-run queue entry, and the engine's #view tail read: record() always makes exactly one
+ * `getEvents(runId, {fromSeq: view.seq + 1})` before it appends, to bring its folded view up to the ledger head (for
+ * a warm view that read returns no events). So the value is an UPPER BOUND over record()'s pre-append window (the
+ * #view getEvents tail read + sanitizePayload + O(1) validation), per DEC-062(1), which amends DEC-051(2). Label:
+ * "upper bound: includes the #view getEvents tail read". The true phase is at most this value.
+ * The value is null unless the calls before the first appendEvent are exactly that one getEvents: a second read,
+ * or any other backend call (a putBlob, a projection, ...), would put unrelated work inside the window.
+ *
+ * The observation's own append (ledger + CAS offload + index) is a ledger append outside the seams, so ledgerAppend
+ * and indexUpdate are null. No merged spans are reported for this measurement: DEC-051(1) approves only the
+ * checkpoint spans.
  */
 export async function measureRecordThenCheckpoint(store: Store, draft: LedgerEventDraft): Promise<MeasuredSample> {
   const w = store.probe.open();
@@ -287,8 +302,8 @@ export async function measureRecordThenCheckpoint(store: Store, draft: LedgerEve
     const ack = performance.now();
     const phases = checkpointPhases(w);
     const firstAppend = need(w, 'firstAppend');
-    // UPPER BOUND on scanRedact (DEC-051(2)); stays null when any other backend call came first.
-    if (w.callsBeforeFirstAppend === 0) phases.scanRedact = firstAppend - start;
+    // upper bound: includes the #view getEvents tail read (DEC-062(1)); null when anything else came first.
+    if (w.readsBeforeFirstAppend === 1 && w.otherCallsBeforeFirstAppend === 0) phases.scanRedact = firstAppend - start;
     return { totalMs: ack - start, phases, unattributed: null };
   } finally {
     store.probe.close();
