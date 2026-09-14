@@ -122,6 +122,32 @@ export interface LocalBackendOptions {
   readonly newEventId?: () => string;
   readonly isProcessAlive?: (pid: number) => boolean;
   readonly faults?: StorageFaults;
+  /**
+   * Observe-only phase timings (SPEC-002 "Measurement definition"). createCheckpoint reports gitCommit (the commit
+   * objects and the checkpoint ref), blobWrite (the state blob), ledgerAppend and indexUpdate. appendEvent reports
+   * ledgerAppend and indexUpdate. Writer acquisition, input validation and fault hooks are not attributed to any
+   * phase. Unset: nothing is timed or reported.
+   *
+   * The same member as the engine's `CheckpointEngineOptions.phaseTimer`; its phase union is the engine's
+   * `CheckpointPhase`, spelled out here because Local Storage does not depend on the Checkpoint Engine.
+   */
+  readonly phaseTimer?:
+    | { add(phase: 'changeDetection' | 'scanRedact' | 'hash' | 'blobWrite' | 'gitCommit' | 'ledgerAppend' | 'indexUpdate', ms: number): void }
+    | undefined;
+}
+
+type StoragePhase = 'blobWrite' | 'gitCommit' | 'ledgerAppend' | 'indexUpdate';
+
+/**
+ * Hand one phase's time to the caller's timer. The timer only observes: if `add()` throws (or is not a function), the
+ * error is caught and ignored HERE, so the write is exactly what it would have been without a timer.
+ */
+function reportPhase(timer: NonNullable<LocalBackendOptions['phaseTimer']>, phase: StoragePhase, ms: number): void {
+  try {
+    timer.add(phase, ms);
+  } catch {
+    // ignored by design: a phase timer never changes a write's control flow or result
+  }
 }
 
 interface Writer {
@@ -183,6 +209,7 @@ export class LocalBackend implements StorageBackend {
   readonly #newEventId: (() => string) | undefined;
   readonly #isProcessAlive: ((pid: number) => boolean) | undefined;
   readonly #faults: StorageFaults;
+  readonly #phaseTimer: LocalBackendOptions['phaseTimer'];
   readonly #writers = new Map<string, Writer>();
   #queue: Promise<unknown> = Promise.resolve();
   #closed = false;
@@ -197,6 +224,7 @@ export class LocalBackend implements StorageBackend {
     this.#newEventId = options.newEventId;
     this.#isProcessAlive = options.isProcessAlive;
     this.#faults = options.faults ?? {};
+    this.#phaseTimer = options.phaseTimer;
   }
 
   /** Open (creating if needed) the store of the git worktree containing `repoDir`. */
@@ -271,13 +299,21 @@ export class LocalBackend implements StorageBackend {
       throw invalid('checkpoint.created is emitted only by createCheckpoint');
     }
     return this.#withWriter(runId, async (writer, paths) => {
+      // ledgerAppend: sealing (hash chain, any payload offload) and the durable log line. indexUpdate: the index rows.
+      const timer = this.#phaseTimer;
+      const mark = timer === undefined ? 0 : performance.now();
       const sealed = await this.#seal(runId, writer, event);
       await appendEventLine(paths.events, sealed);
       writer.head = { seq: sealed.seq, hash: sealed.hash };
+      const appended = timer === undefined ? 0 : performance.now();
       this.#db.transaction(() => {
         this.#db.insertEvent(sealed);
         if (sealed.payload_ref !== null) this.#db.insertBlob(sealed.payload_ref);
       });
+      if (timer !== undefined) {
+        reportPhase(timer, 'ledgerAppend', appended - mark);
+        reportPhase(timer, 'indexUpdate', performance.now() - appended);
+      }
       return sealed;
     });
   }
@@ -344,6 +380,13 @@ export class LocalBackend implements StorageBackend {
       const seq = writer.head.seq + 1;
       const now = this.#clock.now();
 
+      // Phase timing (SPEC-002): gitCommit = steps 1 and 3, blobWrite = step 2, ledgerAppend = step 4 (sealing and the
+      // log line), indexUpdate = step 5. Validation and the fault hooks are not attributed. Without a timer nothing is
+      // timed; the intervals never overlap. Reported once, after the index rows are written.
+      const timer = this.#phaseTimer;
+      let gitCommitMs = 0;
+      let mark = timer === undefined ? 0 : performance.now();
+
       // 1. Workspace objects from the sanitized staging tree (not reachable from any ref yet). With a
       //    parent commit and a delta, built on the parent's tree from the written files only.
       const { commit } = await this.#git.commitTree(input.stagingDir, {
@@ -353,6 +396,11 @@ export class LocalBackend implements StorageBackend {
         timeMs: now,
         tmpDir: this.layout.tmp,
       });
+      if (timer !== undefined) {
+        const t = performance.now();
+        gitCommitMs += t - mark;
+        mark = t;
+      }
 
       // 2. CAS: the deterministic Agent State Object.
       const state: AgentStateObject = {
@@ -365,9 +413,16 @@ export class LocalBackend implements StorageBackend {
         usage,
       };
       const stateRef = await this.#blobs.put(Buffer.from(canonicalJSON(state), 'utf8'));
+      let blobWriteMs = 0;
+      if (timer !== undefined) {
+        const t = performance.now();
+        blobWriteMs = t - mark;
+        mark = t;
+      }
 
       // 3. Git ref.
       await this.#git.updateRef(checkpointRefName(runId, checkpointId), commit);
+      if (timer !== undefined) gitCommitMs += performance.now() - mark;
       await this.#faults.afterRefWrite?.(at);
 
       // 4. Ledger event; its payload is the full checkpoint record, so reindex can rebuild the row.
@@ -386,6 +441,7 @@ export class LocalBackend implements StorageBackend {
       };
       const valid = validateCheckpoint(checkpoint);
       if (!valid.ok) throw invalid(`checkpoint record is invalid: ${valid.errors.join('; ')}`);
+      if (timer !== undefined) mark = performance.now();
       const event = await this.#seal(runId, writer, {
         type: 'checkpoint.created',
         actor: 'runtime',
@@ -397,14 +453,22 @@ export class LocalBackend implements StorageBackend {
       await appendEventLine(paths.events, event);
       writer.head = { seq: event.seq, hash: event.hash };
       writer.nextCheckpoint += 1;
+      const ledgerAppendMs = timer === undefined ? 0 : performance.now() - mark;
       await this.#faults.afterCheckpointEvent?.(at);
 
       // 5. Index rows, last and atomic.
+      if (timer !== undefined) mark = performance.now();
       this.#db.transaction(() => {
         this.#db.insertEvent(event);
         this.#db.insertBlob(stateRef);
         this.#db.insertCheckpoint(checkpoint);
       });
+      if (timer !== undefined) {
+        reportPhase(timer, 'gitCommit', gitCommitMs);
+        reportPhase(timer, 'blobWrite', blobWriteMs);
+        reportPhase(timer, 'ledgerAppend', ledgerAppendMs);
+        reportPhase(timer, 'indexUpdate', performance.now() - mark);
+      }
       return checkpoint;
     });
   }

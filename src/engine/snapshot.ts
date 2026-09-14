@@ -31,6 +31,7 @@ import { isExcludedPath, sanitize } from '../redact/index.js';
 import { RACY_WINDOW_NS } from '../storage/change-detection.js';
 import { errnoCode } from '../storage/fs-util.js';
 import type { WorkspaceChanges } from '../storage/types.js';
+import type { CheckpointPhase } from './engine.js';
 
 /** SPEC-002 "Single file in snapshot: 1 GB". */
 export const MAX_SNAPSHOT_FILE_BYTES = 1024 * 1024 * 1024;
@@ -82,6 +83,12 @@ export interface SnapshotOptions {
   /** Snapshot policy hook: return false to leave a path (and, for a directory, everything under it) out. */
   readonly include?: ((relPath: string) => boolean) | undefined;
   readonly nowNs: () => bigint;
+  /**
+   * Observe-only phase timings (SPEC-002 "Measurement definition"). Each `buildSnapshot` call reports changeDetection,
+   * scanRedact, hash and blobWrite once, each the sum of its intervals in this call. Reading file content, creating
+   * and removing the staging directory are not attributed to any phase. Unset: nothing is timed or reported.
+   */
+  readonly phaseTimer?: { add(phase: CheckpointPhase, ms: number): void } | undefined;
 }
 
 export interface Snapshot {
@@ -196,12 +203,38 @@ async function stageEntry(root: string, rel: string, mode: TreeMode, bytes: Buff
   if (mode === '100755') await chmod(target, 0o700);
 }
 
+/**
+ * Hand one phase's accumulated time to the caller's timer. The timer only observes: if `add()` throws (or is not a
+ * function), the error is caught and ignored HERE, so the snapshot is exactly what it would have been without a timer.
+ */
+function reportPhase(timer: { add(phase: CheckpointPhase, ms: number): void }, phase: CheckpointPhase, ms: number): void {
+  try {
+    timer.add(phase, ms);
+  } catch {
+    // ignored by design: a phase timer never changes a checkpoint's control flow or result
+  }
+}
+
 /** Build the sanitized staging tree for one checkpoint of `workspaceDir`. The caller must call `cleanup()`. */
 export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot> {
+  // Phase timing (SPEC-002). Without a timer `timing` is false: performance.now() is never called, every mark stays 0
+  // and nothing is reported. The timed intervals never overlap, so their sum never exceeds this call's wall time.
+  const timer = options.phaseTimer;
+  const timing = timer !== undefined;
+  let changeDetectionMs = 0;
+  let scanRedactMs = 0;
+  let hashMs = 0;
+  let blobWriteMs = 0;
+  let mark = timing ? performance.now() : 0;
+
+  // changeDetection: walking the workspace and stat-ing every entry.
   const { files: current, skipped } = await listWorkspace(options.workspaceDir, options);
+  if (timing) changeDetectionMs += performance.now() - mark;
   const stagingDir = await mkdtemp(path.join(options.tmpDir, 'ckpt-stage-'));
   const cleanup = (): Promise<void> => rm(stagingDir, { recursive: true, force: true });
   try {
+    // changeDetection: the tree this checkpoint is compared against (the stat cache, or the parent commit's tree).
+    if (timing) mark = performance.now();
     const parentCommit = options.parentCommit;
     const cached =
       parentCommit !== null && options.cache?.workspaceDir === options.workspaceDir && options.cache.baseCommit === parentCommit
@@ -213,7 +246,10 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
     const written: string[] = [];
     let hashed = 0;
     let redactedFiles = 0;
+    if (timing) changeDetectionMs += performance.now() - mark;
     for (const file of current) {
+      // changeDetection: the stat-cache check.
+      if (timing) mark = performance.now();
       const known = cached?.get(file.rel);
       if (
         known !== undefined &&
@@ -224,9 +260,12 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
         file.mtimeNs + RACY_WINDOW_NS < known.hashedAtNs
       ) {
         files.set(file.rel, known);
+        if (timing) changeDetectionMs += performance.now() - mark;
         continue;
       }
+      if (timing) changeDetectionMs += performance.now() - mark;
 
+      // Reading the content is not attributed to any phase.
       const hashedAtNs = options.nowNs();
       let raw: Buffer;
       try {
@@ -236,24 +275,55 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
         throw err;
       }
       hashed += 1;
+      // scanRedact: Redaction of the content.
+      if (timing) mark = performance.now();
       const { bytes, hits } = redactContent(raw);
+      if (timing) {
+        const now = performance.now();
+        scanRedactMs += now - mark;
+        mark = now;
+      }
       if (bytes === null) {
         // Absent from this checkpoint's tree (and so deleted from the parent's, if it was there), reported once.
         skipped.push({ path: file.rel, size: file.size, reason: 'secret_detected' });
         continue;
       }
       if (hits > 0) redactedFiles += 1;
+      // hash: the git blob id of the sanitized content.
       const oid = gitBlobId(bytes, options.objectFormat);
+      if (timing) {
+        const now = performance.now();
+        hashMs += now - mark;
+        mark = now;
+      }
       files.set(file.rel, { mode: file.mode, oid, size: file.size, mtimeNs: file.mtimeNs, ino: file.ino, hashedAtNs });
 
+      // changeDetection: whether the sanitized blob differs from the parent tree. blobWrite: staging it when it does.
       const parent = parentTree.get(file.rel);
       if (parentCommit === null || parent === undefined || parent.mode !== file.mode || parent.oid !== oid) {
+        if (timing) {
+          const now = performance.now();
+          changeDetectionMs += now - mark;
+          mark = now;
+        }
         await stageEntry(stagingDir, file.rel, file.mode, bytes);
         written.push(file.rel);
+        if (timing) blobWriteMs += performance.now() - mark;
+      } else if (timing) {
+        changeDetectionMs += performance.now() - mark;
       }
     }
 
+    // changeDetection: the parent tree's paths that are gone.
+    if (timing) mark = performance.now();
     const changes = parentCommit === null ? undefined : { written, deleted: [...parentTree.keys()].filter((p) => !files.has(p)) };
+    if (timer !== undefined) {
+      changeDetectionMs += performance.now() - mark;
+      reportPhase(timer, 'changeDetection', changeDetectionMs);
+      reportPhase(timer, 'scanRedact', scanRedactMs);
+      reportPhase(timer, 'hash', hashMs);
+      reportPhase(timer, 'blobWrite', blobWriteMs);
+    }
     return { stagingDir, changes, files, skipped, hashed, redactedFiles, cleanup };
   } catch (err) {
     await cleanup();

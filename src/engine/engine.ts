@@ -69,6 +69,12 @@ export const ENGINE_OWNED_EVENT_TYPES: ReadonlySet<string> = new Set([
 const LATEST_SEQ = Number.MAX_SAFE_INTEGER;
 const MAX_LINEAGE_DEPTH = 10_000;
 
+/**
+ * The checkpoint phases SPEC-002 "Measurement definition" reports, exactly these 7. bench/results.schema.ts `Phase`
+ * is the same set; src/** never imports bench/**, so tests/unit/engine/phase-timer.test.ts checks that they agree.
+ */
+export type CheckpointPhase = 'changeDetection' | 'scanRedact' | 'hash' | 'blobWrite' | 'gitCommit' | 'ledgerAppend' | 'indexUpdate';
+
 export interface CheckpointEngineOptions {
   readonly backend: StorageBackend;
   /** Any directory inside the user's git worktree (the same repository the backend stores into). */
@@ -85,6 +91,15 @@ export interface CheckpointEngineOptions {
   readonly maxFileBytes?: number;
   /** Epoch nanoseconds, for the change-detection racy-clean guard. */
   readonly nowNs?: () => bigint;
+  /**
+   * Observe-only per-phase timings for `checkpoint()` (SPEC-002 "Measurement definition"). The engine hands it to
+   * buildSnapshot, which reports changeDetection, scanRedact, hash and blobWrite (the staged files). The storage
+   * phases (gitCommit, blobWrite of the state blob, ledgerAppend, indexUpdate) come from the backend's own
+   * `phaseTimer` (LocalBackendOptions), so a caller that wants all 7 passes the same timer to both. A phase whose code
+   * runs more than once in one checkpoint (e.g. ledgerAppend) is reported each time; the timer sums the reports. The
+   * timer only observes: an `add()` that throws is caught and ignored where it is called. Unset: nothing is timed.
+   */
+  readonly phaseTimer?: { add(phase: CheckpointPhase, ms: number): void } | undefined;
 }
 
 interface ForkOrigin {
@@ -128,6 +143,7 @@ export class CheckpointEngine {
   readonly #snapshotFilter: ((relPath: string) => boolean) | undefined;
   readonly #maxFileBytes: number;
   readonly #nowNs: () => bigint;
+  readonly #phaseTimer: CheckpointEngineOptions['phaseTimer'];
   readonly #views = new Map<string, RunView>();
   readonly #queues = new Map<string, Promise<void>>();
 
@@ -140,6 +156,7 @@ export class CheckpointEngine {
     this.#snapshotFilter = options.snapshotFilter;
     this.#maxFileBytes = options.maxFileBytes ?? MAX_SNAPSHOT_FILE_BYTES;
     this.#nowNs = options.nowNs ?? (() => BigInt(Date.now()) * 1_000_000n);
+    this.#phaseTimer = options.phaseTimer;
   }
 
   static async open(options: CheckpointEngineOptions): Promise<CheckpointEngine> {
@@ -263,6 +280,7 @@ export class CheckpointEngine {
         skipRootEntries: new Set(view.workspace === 'repo' ? [STORE_DIR_NAME] : []),
         include: this.#snapshotFilter,
         nowNs: this.#nowNs,
+        phaseTimer: this.#phaseTimer,
       });
       try {
         for (const skipped of snapshot.skipped) {
