@@ -25,7 +25,13 @@ function assertBudgetShape(budget: DistillBudget): void {
   }
 }
 
-/** Throws DISTILL_BUDGET_EXCEEDED when the run has already spent its cap (spentUsd >= capUsd). */
+/**
+ * Throws DISTILL_BUDGET_EXCEEDED when the run has already spent its cap (spentUsd >= capUsd).
+ *
+ * This is SPEC-007's rule as stated: the check runs BEFORE a call, and a call's cost is only known after it.
+ * So one distillation that starts below the cap can finish above it (0.24 spent + a 0.05 call = 0.29 of a
+ * 0.25 cap). The overshoot is bounded by one call, and the next distillation of the run is refused.
+ */
 export function assertBudgetAvailable(budget: DistillBudget): void {
   assertBudgetShape(budget);
   if (budget.spentUsd >= budget.capUsd) {

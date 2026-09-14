@@ -2,9 +2,15 @@
  * Claim validation (SPEC-007 "Must never ... persist a claim whose provenance is empty, or cites an event
  * id outside ledgerRange / an artifact/checkpoint not in the store"). A failing claim is dropped whole and
  * counted, never repaired.
+ *
+ * Provider output is new text bound for CAS, and SPEC-003 sends every CAS write through the sanitizer. A kept
+ * claim's `value` is therefore sanitized, and a claim citing a workspace path that sanitize() flags is dropped.
+ * Event ids, artifact refs and checkpoint ids are only kept when they match known inputs, so they are left
+ * as they are.
  */
 import type { SemanticClaim } from '../model/types.js';
 import { validateSemanticClaim } from '../model/validate.js';
+import { sanitize } from '../redact/index.js';
 import { DISTILLED_FIELDS, type DistilledField } from './types.js';
 
 export interface ProvenanceContext {
@@ -86,6 +92,8 @@ async function checkClaim(candidate: unknown, context: ProvenanceContext): Promi
   if (!event_ids.every((id) => context.eventIds.has(id))) return null;
   if (!artifact_refs.every((ref) => context.artifactRefs.has(ref))) return null;
   if (!workspace_paths.every(isWorkspacePath)) return null;
+  // A path is cited evidence and cannot be partly redacted, so a secret-bearing path drops the claim.
+  if (workspace_paths.some((workspacePath) => sanitize(workspacePath).hits.length > 0)) return null;
   for (const id of checkpoint_ids) {
     if (!(await context.hasCheckpoint(id))) return null;
   }
@@ -93,7 +101,7 @@ async function checkClaim(candidate: unknown, context: ProvenanceContext): Promi
   // Rebuilt from the checked members only: the origin is always `distilled`, whatever the provider said.
   const claim: SemanticClaim = {
     field,
-    value,
+    value: sanitize(value).output,
     origin: 'distilled',
     ...(score === undefined ? {} : { confidence: score }),
     provenance: { event_ids, artifact_refs, workspace_paths, checkpoint_ids },

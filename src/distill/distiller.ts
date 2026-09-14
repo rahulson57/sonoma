@@ -113,11 +113,24 @@ export async function distill(request: DistillRequest, deps: DistillDeps): Promi
 
   const [from, to] = request.ledgerRange;
   const { stateHash, state } = await source.readState(request.checkpointId);
+  // Both ends of ledgerRange come from the store, not the caller. The upper end is the checkpoint's cursor.
+  // The lower end is its parent's cursor, or 0 for a run's first checkpoint: a fork's first checkpoint has no
+  // parent and its run starts at seq 1. A caller can neither widen the delta towards the full run trajectory
+  // nor narrow it.
+  const checkpoint = await source.readCheckpoint(request.checkpointId);
+  const parent = checkpoint.parent_checkpoint_id === null ? null : await source.readCheckpoint(checkpoint.parent_checkpoint_id);
+  const previousCursor = parent === null ? 0 : parent.ledger_seq;
   const mismatches = [
     stateHash !== request.stateHash ? `stateHash is ${stateHash}` : null,
     state.checkpoint_id !== request.checkpointId || state.run_id !== source.runId ? `state belongs to ${state.run_id}/${state.checkpoint_id}` : null,
+    checkpoint.checkpoint_id !== request.checkpointId ? `checkpoint record belongs to ${checkpoint.checkpoint_id}` : null,
     state.workspace_commit !== request.workspaceCommit ? `workspaceCommit is ${state.workspace_commit}` : null,
     state.ledger_seq !== to ? `the checkpoint cursor is ${state.ledger_seq}, not ${to}` : null,
+    from !== previousCursor
+      ? parent === null
+        ? `ledgerRange starts at ${from}, but ${request.checkpointId} is the first checkpoint of its run, so it starts at 0`
+        : `ledgerRange starts at ${from}, but the parent checkpoint ${parent.checkpoint_id} has cursor ${previousCursor}`
+      : null,
   ].filter((m): m is string => m !== null);
   if (mismatches.length > 0) {
     throw new DistillError('DISTILL_INPUT_MISMATCH', `request does not match ${source.runId}/${request.checkpointId}: ${mismatches.join('; ')}`);

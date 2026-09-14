@@ -4,7 +4,10 @@
  */
 import { describe, expect, it } from 'vitest';
 import { distill, validateClaims } from '../../../src/distill/index.js';
+import { secretCorpus } from '../../helpers/fakeSecrets.js';
 import { depsFor, fakeRun, provenance, reply, spyProvider } from './support.js';
+
+const GITHUB_SECRET = secretCorpus().find((sample) => sample.kind === 'github')!.value;
 
 /** Checkpoint c_2 covers seq (20, 40] of a 60-event run. */
 const RUN = { events: 60, prevCursor: 20, cursor: 40 } as const;
@@ -93,8 +96,26 @@ describe('validateClaims()', () => {
     ['a checkpoint not in the store', { ...base, provenance: provenance({ checkpoint_ids: ['c_9'] }) }],
     ['a workspace path escaping the commit', { ...base, provenance: provenance({ workspace_paths: ['../secrets.txt'] }) }],
     ['an absolute workspace path', { ...base, provenance: provenance({ workspace_paths: ['/etc/passwd'] }) }],
+    ['a workspace path carrying a secret', { ...base, provenance: provenance({ workspace_paths: [`config/${GITHUB_SECRET}.txt`] }) }],
   ])('rejects %s', async (_label, candidate) => {
     await expect(validateClaims([candidate], context)).resolves.toEqual({ claims: [], rejectedClaims: 1 });
+  });
+
+  it('sanitizes provider-authored claim values before they can be stored', async () => {
+    const corpus = secretCorpus();
+    const result = await validateClaims(
+      corpus.map(({ kind, value }) => ({ ...base, value: `the ${kind} credential is ${value}` })),
+      context,
+    );
+
+    expect(result.rejectedClaims).toBe(0);
+    expect(result.claims).toHaveLength(corpus.length);
+    for (const [index, { kind, value }] of corpus.entries()) {
+      const kept = result.claims[index]!.value;
+      expect(kept.includes(value), `${kind} value kept in a claim`).toBe(false);
+      expect(kept).toContain('[REDACTED:');
+      expect(kept).toContain(`the ${kind} credential is `);
+    }
   });
 
   it('keeps valid claims, forces origin to distilled and drops unknown members', async () => {

@@ -56,4 +56,30 @@ describe('distill() prompt bounding', () => {
     expect(sent['payload_ref']).toBe(refOf(50));
     expect(sent['payload']).toEqual(fakeLedgerEvents(120, 7)[49]!.payload);
   });
+
+  it('refuses a ledgerRange that does not start at the parent checkpoint cursor, before reading the ledger or calling the provider', async () => {
+    const run = await fakeRun({ events: 120, prevCursor: 40, cursor: 90 });
+    const provider = spyProvider(reply([]));
+
+    // Widened towards the start of the run (0 would be the full trajectory), or narrowed past the parent's cursor.
+    for (const from of [0, 39, 41, 60]) {
+      await expect(distill({ ...run.request, ledgerRange: [from, 90] }, depsFor(run, provider))).rejects.toMatchObject({
+        code: 'DISTILL_INPUT_MISMATCH',
+      });
+    }
+
+    expect(provider.prompts).toHaveLength(0);
+    expect(run.calls.readEvents).toEqual([]);
+    expect(run.calls.readCheckpoint).toContain('c_1');
+  });
+
+  it('refuses a first checkpoint whose ledgerRange does not start at 0', async () => {
+    const run = await fakeRun({ events: 30, prevCursor: 0, cursor: 12 });
+    const provider = spyProvider(reply([]));
+
+    await expect(distill({ ...run.request, ledgerRange: [5, 12] }, depsFor(run, provider))).rejects.toMatchObject({ code: 'DISTILL_INPUT_MISMATCH' });
+
+    expect(provider.prompts).toHaveLength(0);
+    expect(run.calls.readEvents).toEqual([]);
+  });
 });

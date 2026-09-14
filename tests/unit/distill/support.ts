@@ -7,6 +7,7 @@ import {
   BlobProjectionStore,
   createBudget,
   type DistillBudget,
+  type DistillCheckpoint,
   type DistillEvent,
   type DistillRequest,
   type DistillSource,
@@ -92,10 +93,13 @@ export interface FakeRun {
   readonly blobs: MemoryBlobs;
   readonly source: DistillSource;
   /** What the distiller asked the source for. */
-  readonly calls: { readState: number; readEvents: Array<{ fromSeq: number; toSeq: number }>; readBlob: string[] };
+  readonly calls: { readState: number; readCheckpoint: string[]; readEvents: Array<{ fromSeq: number; toSeq: number }>; readBlob: string[] };
 }
 
-/** One run of `events` fake ledger events, distilling checkpoint c_2 over (prevCursor, cursor]. */
+/**
+ * One run of `events` fake ledger events, distilling checkpoint c_2 over (prevCursor, cursor]. c_2's parent
+ * is c_1 with cursor prevCursor; with prevCursor 0, c_2 is the run's first checkpoint and has no parent.
+ */
 export async function fakeRun(options: FakeRunOptions): Promise<FakeRun> {
   const blobs = new MemoryBlobs();
   const raw = fakeLedgerEvents(options.events, options.seed ?? 7);
@@ -121,13 +125,23 @@ export async function fakeRun(options: FakeRunOptions): Promise<FakeRun> {
   };
   const stateHash = sha256(canonicalJSON(state));
   const known = new Set(options.checkpoints ?? ['c_1', 'c_2']);
-  const calls: FakeRun['calls'] = { readState: 0, readEvents: [], readBlob: [] };
+  const records = new Map<string, DistillCheckpoint>([
+    ['c_1', { checkpoint_id: 'c_1', parent_checkpoint_id: null, ledger_seq: options.prevCursor }],
+    ['c_2', { checkpoint_id: 'c_2', parent_checkpoint_id: options.prevCursor === 0 ? null : 'c_1', ledger_seq: options.cursor }],
+  ]);
+  const calls: FakeRun['calls'] = { readState: 0, readCheckpoint: [], readEvents: [], readBlob: [] };
   const source: DistillSource = {
     runId,
     async readState(checkpointId) {
       calls.readState += 1;
       if (checkpointId !== state.checkpoint_id) throw new Error(`unknown checkpoint ${checkpointId}`);
       return { stateHash, state };
+    },
+    async readCheckpoint(checkpointId) {
+      calls.readCheckpoint.push(checkpointId);
+      const record = records.get(checkpointId);
+      if (record === undefined) throw new Error(`unknown checkpoint ${checkpointId}`);
+      return record;
     },
     // Deliberately the WHOLE run, whatever the range: bounding the prompt is the distiller's job.
     async readEvents(range) {
@@ -158,7 +172,7 @@ export function untouchableSource(runId: string): DistillSource {
   const refuse = async (): Promise<never> => {
     throw new Error('the store must not be read');
   };
-  return { runId, readState: refuse, readEvents: refuse, readBlob: refuse, hasCheckpoint: refuse };
+  return { runId, readState: refuse, readCheckpoint: refuse, readEvents: refuse, readBlob: refuse, hasCheckpoint: refuse };
 }
 
 export function depsFor(run: FakeRun, provider: DistillerProvider, budget?: DistillBudget) {

@@ -68,11 +68,22 @@ export interface DistillEvent {
   readonly payload_ref?: BlobRef | null;
 }
 
+/** The members of a checkpoint record the distiller reads. A Checkpoint satisfies it. */
+export interface DistillCheckpoint {
+  readonly checkpoint_id: string;
+  /** null for a run's first checkpoint (including a fork's first checkpoint). */
+  readonly parent_checkpoint_id: string | null;
+  /** Cursor: seq of the last ledger event the checkpoint includes. */
+  readonly ledger_seq: number;
+}
+
 /** Where a distillation reads its inputs from: one run of the store. See storageSource(). */
 export interface DistillSource {
   readonly runId: string;
   /** The checkpoint's Agent State Object and the sha256 of its stored blob bytes. */
   readState(checkpointId: string): Promise<{ readonly stateHash: string; readonly state: AgentStateObject }>;
+  /** The stored checkpoint record of this run. Rejects when the run has no such checkpoint. */
+  readCheckpoint(checkpointId: string): Promise<DistillCheckpoint>;
   /** Events with fromSeq <= seq <= toSeq. The distiller re-applies the bound, so extra events are ignored. */
   readEvents(range: { readonly fromSeq: number; readonly toSeq: number }): Promise<readonly DistillEvent[]>;
   /** Bytes of a CAS blob: an offloaded event payload, already sanitized before it was stored. */

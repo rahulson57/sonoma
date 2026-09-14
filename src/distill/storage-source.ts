@@ -28,6 +28,15 @@ export function storageSource(storage: DistillStorage, runId: string): DistillSo
       return { stateHash, state: await storage.getState(ref) };
     },
 
+    async readCheckpoint(checkpointId) {
+      const checkpoint = await storage.getCheckpoint({ run_id: runId, checkpoint_id: checkpointId });
+      return {
+        checkpoint_id: checkpoint.checkpoint_id,
+        parent_checkpoint_id: checkpoint.parent_checkpoint_id,
+        ledger_seq: checkpoint.ledger_seq,
+      };
+    },
+
     async readEvents(range) {
       if (range.fromSeq > range.toSeq) return [];
       return storage.getEvents(runId, { fromSeq: range.fromSeq, toSeq: range.toSeq });
