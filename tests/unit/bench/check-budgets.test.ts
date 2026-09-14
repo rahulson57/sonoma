@@ -105,7 +105,7 @@ describe('check-budgets CLI', () => {
       const { code, stdout } = await runCli(['--results', NULL_BUDGET_UNMEASURED]);
       expect(code).toBe(0);
       expect(stdout).toMatch(
-        /INFO d-secret-output .*reported, not budgeted; not measured: changeDetection, hash, blobWrite, gitCommit, ledgerAppend, indexUpdate/,
+        /INFO d-secret-output .*\(reported, not budgeted\); not measured: changeDetection, hash, blobWrite, gitCommit, ledgerAppend, indexUpdate$/m,
       );
       expect(stdout).not.toContain('NOT MEASURED');
       for (const [scenario] of BUDGETED) expect(stdout).toContain(`PASS ${scenario}`);
