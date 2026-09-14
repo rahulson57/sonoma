@@ -208,9 +208,15 @@ export function createHookHandler(options: HookHandlerOptions): HookHandler {
     if (isErrorResponse(hook.response)) return (await append(call, toolFailedResponse(hook))).event_id;
     if (!WORKSPACE_TOOLS.has(hook.tool)) return (await append(call, toolCompleted(hook))).event_id;
 
-    // The tool has already run. Both steps start together (statusOf never rejects), but statusOf first awaits
-    // engine.workspaceDir(), which the engine serializes behind record(): in practice git status runs after the append.
-    const [completed, observed] = await Promise.all([append(call, toolCompleted(hook)), statusOf(call.runId)]);
+    // The tool has already run, so its after-status can be read while tool.completed is appended: the hook then takes
+    // about max(record, git status) rather than their sum. statusOf is started FIRST on purpose. The engine serializes
+    // workspaceDir() behind record() per run, so started second it would wait for the append and git status would
+    // run after it. Appending tool.completed cannot move the workspace directory (only resume, rollback and fork
+    // events do), and the store directory the append writes to is excluded from the status. statusOf never rejects,
+    // so it is safe to leave pending if the append throws.
+    const observing = statusOf(call.runId);
+    const completed = await append(call, toolCompleted(hook));
+    const observed = await observing;
     if (observed.status === null) {
       await appendError(call, hook.kind, 'workspace_status', observed.error);
       return completed.event_id;

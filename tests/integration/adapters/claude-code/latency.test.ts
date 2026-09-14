@@ -1,15 +1,20 @@
 /**
  * SPEC-009 criterion: handleHook p95 < 50 ms over 1000 non-boundary invocations (checkpoint boundaries excluded).
  *
- * WHAT IS ASSERTED (Q-027 default B, pending the coordinator's ruling; objection recorded on SPEC-009): the latency the
- * ADAPTER adds to a hook, i.e. each invocation's wall time minus the time spent inside the Checkpoint Engine's
- * record()/checkpoint(). That is SPEC-009's Must-never wording, "Add more than 50 ms p95 per hook invocation". It still
- * counts everything the adapter itself does: payload parsing, the HookMapping, `git status` for Write/Edit/Bash, the
- * ledger walk back to the PreToolUse and the lock-retry loop.
+ * WHAT IS ASSERTED (DEC-046, from Q-027): the latency the ADAPTER adds to a hook, i.e. each invocation's wall time
+ * minus the time spent inside the Checkpoint Engine's record()/checkpoint(). That is SPEC-009's Must-never wording,
+ * "Add more than 50 ms p95 per hook invocation". Everything else stays inside the window: payload parsing, the
+ * HookMapping, workspaceDir(), `git status` for Write/Edit/Bash, the ledger walk back to the PreToolUse and the
+ * lock-retry sleeps.
+ * `git status` is one git process, and it is nearly all of the adapter's own time (the rest is well under 1 ms). On
+ * PreToolUse it is counted in full, because it must finish before tool.requested, which carries its digest, is
+ * appended. On PostToolUse the tool has already run, so the handler reads it while tool.completed is being appended.
+ * Only the part that outlasts record() is added wall time there, which is exactly what the hook adds. The ordering
+ * is pinned by tests/unit/adapters/claude-code/status-timing.test.ts, and the two paths are reported separately.
  * Why not the absolute wall time: every record() fsyncs the ledger (storage), and `npm test` runs every test file in
- * parallel. Measured on this code, the same 1000 invocations have an absolute p95 of about 41 ms alone, and 170–190 ms
- * inside the full suite, where hooks that never touch git are just as slow. The adapter's own logic stays at about
- * 0.4 ms p95. The absolute p95 is still computed and reported, just not asserted.
+ * parallel. The same 1000 invocations have an absolute p95 of about 43 ms alone and well over 100 ms inside the full
+ * suite, where hooks that never touch git are just as slow. The absolute p95 is still computed and reported, just not
+ * asserted.
  *
  * Real engine, LocalBackend and `git status` in a throwaway repository (tests/helpers/tmpRepo.ts), one bound run, and a
  * realistic hook mix repeated per turn: a prompt, then PreToolUse/PostToolUse pairs for Read, Grep, Write, Edit and
@@ -62,16 +67,20 @@ describe('hook latency', () => {
       const added: number[] = [];
       const gitAbsolute: number[] = [];
       const gitAdded: number[] = [];
-      const timed = async (usesGit: boolean, payload: Record<string, unknown>): Promise<void> => {
+      const gitAddedPre: number[] = [];
+      const gitAddedPost: number[] = [];
+      /** `git`: the invocation reads git status, before its append (PreToolUse) or during it (PostToolUse). */
+      const timed = async (git: 'pre' | 'post' | null, payload: Record<string, unknown>): Promise<void> => {
         engineMs = 0;
         const start = performance.now();
         const id = await handler.handleHook(payload);
         const elapsed = performance.now() - start;
         absolute.push(elapsed);
         added.push(elapsed - engineMs);
-        if (usesGit) {
+        if (git !== null) {
           gitAbsolute.push(elapsed);
           gitAdded.push(elapsed - engineMs);
+          (git === 'pre' ? gitAddedPre : gitAddedPost).push(elapsed - engineMs);
         }
         expect(id).not.toBeNull();
       };
@@ -80,20 +89,22 @@ describe('hook latency', () => {
       let call = 0;
       while (absolute.length < INVOCATIONS) {
         turn += 1;
-        const steps: Array<() => Promise<void>> = [() => timed(false, hookInput('UserPromptSubmit', { prompt: `turn ${turn}: keep going` }))];
+        const steps: Array<() => Promise<void>> = [() => timed(null, hookInput('UserPromptSubmit', { prompt: `turn ${turn}: keep going` }))];
         for (const tool of ['Read', 'Grep', 'Write', 'Edit', 'Bash']) {
           call += 1;
           const id = `toolu_01Latency${String(call).padStart(12, '0')}`;
           const usesGit = WORKSPACE_TOOLS.has(tool);
           const input =
             tool === 'Bash' ? { command: 'npm test' } : tool === 'Write' ? { file_path: `notes/turn-${turn}.md`, content: `turn ${turn}\n` } : { file_path: 'src/app.ts' };
-          steps.push(() => timed(usesGit, hookInput('PreToolUse', { tool_name: tool, tool_input: input, tool_use_id: id })));
+          steps.push(() => timed(usesGit ? 'pre' : null, hookInput('PreToolUse', { tool_name: tool, tool_input: input, tool_use_id: id })));
           if (tool === 'Write') steps.push(() => writeFiles(fx.repo.dir, { [`notes/turn-${turn}.md`]: `turn ${turn}\n` }));
           if (tool === 'Edit' && turn % 2 === 0) steps.push(() => writeFiles(fx.repo.dir, { 'src/app.ts': `export const version = ${turn};\n` }));
-          steps.push(() => timed(usesGit, hookInput('PostToolUse', { tool_name: tool, tool_input: input, tool_response: { stdout: 'ok\n'.repeat(20) }, tool_use_id: id })));
+          steps.push(() =>
+            timed(usesGit ? 'post' : null, hookInput('PostToolUse', { tool_name: tool, tool_input: input, tool_response: { stdout: 'ok\n'.repeat(20) }, tool_use_id: id })),
+          );
         }
         call += 1;
-        steps.push(() => timed(false, hookInput('PostToolUseFailure', { tool_name: 'Bash', tool_use_id: `toolu_01Latency${String(call).padStart(12, '0')}`, error: 'exit 1' })));
+        steps.push(() => timed(null, hookInput('PostToolUseFailure', { tool_name: 'Bash', tool_use_id: `toolu_01Latency${String(call).padStart(12, '0')}`, error: 'exit 1' })));
         for (const step of steps) {
           if (absolute.length >= INVOCATIONS) break;
           await step();
@@ -112,6 +123,8 @@ describe('hook latency', () => {
       const report = [
         summary('added, all hooks', added),
         summary('added, Write/Edit/Bash', gitAdded),
+        summary('added, PreToolUse Write/Edit/Bash (git status counted in full)', gitAddedPre),
+        summary('added, PostToolUse Write/Edit/Bash (git status beside the append)', gitAddedPost),
         summary('absolute, all hooks', absolute),
         summary('absolute, Write/Edit/Bash', gitAbsolute),
       ].join('; ');
