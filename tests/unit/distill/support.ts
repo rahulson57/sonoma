@@ -54,7 +54,7 @@ export function spyProvider(text: string, options: { name?: string; model?: stri
   const prompts: string[] = [];
   return {
     name: options.name ?? 'anthropic',
-    model: options.model ?? 'claude-haiku-4-5-20251001',
+    model: options.model ?? 'claude-haiku-4-5',
     prompts,
     async complete(prompt: string) {
       prompts.push(prompt);

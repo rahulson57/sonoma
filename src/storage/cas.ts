@@ -131,6 +131,19 @@ export class BlobStore {
     return verify;
   }
 
+  /** Up to `length` leading bytes of a stored blob. Not verified: only for cheap content sniffing before `read`. */
+  async readPrefix(ref: BlobRef, length: number): Promise<Buffer> {
+    assertBlobRef(ref);
+    const handle = await open(this.pathFor(ref.sha256), 'r');
+    try {
+      const prefix = Buffer.alloc(Math.max(0, Math.min(length, ref.size)));
+      const { bytesRead } = await handle.read(prefix, 0, prefix.byteLength, 0);
+      return prefix.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+  }
+
   /** Read a whole blob into memory (verified). */
   async read(ref: BlobRef): Promise<Buffer> {
     const chunks: Buffer[] = [];

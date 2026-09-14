@@ -7,11 +7,14 @@
  * - `tool.failed` → PENDING (known not done, safe to retry). Never completed.
  * Completion is sticky: a later failure event does not undo a recorded acknowledgement.
  *
- * Requests and acknowledgements are matched by the payload member named in INTENT_ID_KEYS
+ * Requests and acknowledgements are matched by intent id, per kind. An event's intent id is its top-level
+ * `intent_id` (SPEC-015 amendment 2). That member is hashed and stays on the event when the payload is
+ * offloaded to a blob, so an offloaded acknowledgement still correlates. An event without one (null, or
+ * sealed before the amendment) falls back to the payload member named in INTENT_ID_KEYS
  * (`tool_call_id` / `side_effect_id`). Only an acknowledgement recorded AFTER its request counts.
  * A request that carries no id is still reported (intent_id: null) and stays in_progress. An
- * acknowledgement whose id cannot be read is ignored, including one whose payload was offloaded to a
- * blob. Its intent then stays in_progress. That is the safe direction: an intent is never reported
+ * acknowledgement whose id cannot be read is ignored, including an offloaded one with no top-level
+ * intent_id. Its intent then stays in_progress. That is the safe direction: an intent is never reported
  * completed on evidence the ledger does not show.
  */
 import type { IntentKind, IntentStatus, LedgerEvent, PendingIntent } from '../model/types.js';
@@ -40,6 +43,9 @@ const RULES: ReadonlyMap<string, Rule> = new Map<string, Rule>([
 type MutableIntent = { -readonly [K in keyof PendingIntent]: PendingIntent[K] };
 
 function intentId(event: LedgerEvent, kind: IntentKind): string | null {
+  // `?? null`: an event sealed before SPEC-015 has no intent_id member at all.
+  const top = event.intent_id ?? null;
+  if (typeof top === 'string' && top.length > 0) return top;
   const value = event.payload?.[INTENT_ID_KEYS[kind]];
   return typeof value === 'string' && value.length > 0 ? value : null;
 }

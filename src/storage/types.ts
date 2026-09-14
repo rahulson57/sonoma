@@ -21,6 +21,8 @@ import type {
   LedgerEventDraft,
   PendingIntent,
   Run,
+  SemanticClaim,
+  SemanticProjection,
   TokenUsage,
 } from '../model/types.js';
 
@@ -77,8 +79,30 @@ export interface NewCheckpoint {
   readonly changes?: WorkspaceChanges;
 }
 
+/**
+ * Which projections (or claims) to list (SPEC-005 / SPEC-015 amendment 4).
+ *
+ * - `{ runId, checkpointId }`: one checkpoint. Checkpoint ids `c_<n>` repeat in every run, so the run is required
+ *   (coordinator ruling on challenge 01a09deb against SPEC-015).
+ * - `{ runId, lineage: true }`: every checkpoint of the run, plus, for each fork-ancestor run, the checkpoint the
+ *   child was forked from and its parent_checkpoint_id ancestors (inclusive), recursively.
+ */
+export type ProjectionQuery =
+  | { readonly runId: string; readonly checkpointId: string; readonly lineage?: undefined }
+  | { readonly runId: string; readonly lineage: true };
+
+export interface ReindexCounts {
+  readonly runs: number;
+  readonly checkpoints: number;
+  readonly events: number;
+  readonly projections: number;
+  readonly claims: number;
+}
+
 export interface StorageBackend {
   createRun(input: NewRun): Promise<Run>;
+  /** Every run in the store, forks included, ordered by created_at then run_id. Identical before and after reindex(). */
+  listRuns(): Promise<Run[]>;
   appendEvent(runId: string, event: NewLedgerEvent): Promise<LedgerEvent>;
   getEvents(runId: string, range: { fromSeq: number; toSeq: number }): Promise<LedgerEvent[]>;
   /** sha256, dedup */
@@ -96,6 +120,19 @@ export interface StorageBackend {
   getCheckpoint(id: CheckpointRef): Promise<Checkpoint>;
   listCheckpoints(runId: string): Promise<Checkpoint[]>;
   getState(id: CheckpointRef): Promise<AgentStateObject>;
+  /**
+   * Durably stores a validated projection (`distilled` or `declared`) as a CAS blob of its canonical JSON, then
+   * indexes it and its claims (SPEC-005 "Durable projection-and-claim index"). The owning checkpoint is the one
+   * whose id is `checkpointId` and whose state hash is `input.stateHash`; it must already exist. Projections are
+   * immutable: storing the same bytes again returns the same ref, and a different projection under a stored id
+   * rejects with ERR_INVALID_INPUT.
+   */
+  putProjection(p: SemanticProjection): Promise<BlobRef>;
+  /** Oldest lineage position first, then createdAt, then id. From a fresh process too: nothing is held in memory. */
+  listProjections(q: ProjectionQuery): Promise<SemanticProjection[]>;
+  /** The claims of listProjections(q), in that order, each projection's claims in their stored order. */
+  listClaims(q: ProjectionQuery): Promise<SemanticClaim[]>;
   fork(id: CheckpointRef): Promise<Run>;
-  reindex(): Promise<{ runs: number; checkpoints: number; events: number }>;
+  /** Rebuilds checkpoint.db from runs/, CAS and refs, including the projection and claim rows. */
+  reindex(): Promise<ReindexCounts>;
 }

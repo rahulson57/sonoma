@@ -9,8 +9,10 @@
  * 4. A regular file over the SPEC-002 1 GB limit is not read and is reported for a
  *    `workspace.file_skipped` event.
  * Every remaining file's bytes (and every symlink's target) pass through Redaction before they are staged:
- * valid UTF-8 up to 64 MB through `sanitize()`, anything else through the byte-exact windowed `scanBytes()`
- * with each hit replaced by its redaction marker, so a clean binary file is committed byte-identical.
+ * valid UTF-8 up to 64 MB is text and `sanitize()` redacts it in place. Anything else (non-UTF-8, or over the text
+ * limit) goes through the byte-exact windowed `scanBytes()`. A clean one is committed byte-identical. One with ANY
+ * secret hit is SKIPPED (SPEC-003 / SPEC-006, DEC-037, SPEC-015 amendment 6): it is left out of the checkpoint tree
+ * and reported once for a `workspace.file_skipped` event, never redacted in place.
  *
  * Incremental (SPEC-005 change detection, DEC-019(1)): with a parent commit, only files whose sanitized
  * blob differs from the parent tree are staged, and storage gets the `{written, deleted}` delta. A
@@ -23,9 +25,8 @@ import { createHash } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-// S02 internals, used ONLY inside redactContent() (DEC-026, interim).
+// S02 internal, used ONLY inside redactContent() (DEC-026 scanner, DEC-037 skip rule).
 import { scanBytes } from '../redact/bundle.js';
-import { redactionMarker } from '../redact/detectors.js';
 import { isExcludedPath, sanitize } from '../redact/index.js';
 import { RACY_WINDOW_NS } from '../storage/change-detection.js';
 import { errnoCode } from '../storage/fs-util.js';
@@ -62,7 +63,8 @@ export interface SnapshotCache {
 export interface SkippedFile {
   readonly path: string;
   readonly size: number | null;
-  readonly reason: 'too_large' | 'unreadable_name';
+  /** `secret_detected`: non-UTF-8 (or over-limit) content in which the byte scanner found a secret (DEC-037). */
+  readonly reason: 'too_large' | 'unreadable_name' | 'secret_detected';
 }
 
 export interface SnapshotOptions {
@@ -91,7 +93,7 @@ export interface Snapshot {
   readonly skipped: SkippedFile[];
   /** Files whose content was read in this pass. */
   readonly hashed: number;
-  /** Files (or symlink targets) in which Redaction replaced something. */
+  /** Text files (or symlink targets) in which Redaction replaced something. Skipped files are in `skipped`. */
   readonly redactedFiles: number;
   cleanup(): Promise<void>;
 }
@@ -104,31 +106,26 @@ export function gitBlobId(bytes: Uint8Array, format: ObjectFormat): string {
 }
 
 /**
- * Redact `raw` (file content or a symlink target). Returns `raw` itself when nothing was found.
+ * Redact `raw` (file content or a symlink target) for the staging tree.
  *
- * DEC-026 (INTERIM, pending the human's answer to MSG-3323 item 2): non-UTF-8 content and content over
- * TEXT_SANITIZE_MAX_BYTES is redacted IN PLACE with S02's reviewed windowed scanner. `scanBytes` and
- * `redactionMarker` are S02 internals, not part of the public src/redact/index.ts contract, so their use is
- * confined to this one function. If the human instead chooses a public sanitizeBytes, or skipping
- * secret-bearing files via `workspace.file_skipped`, only this function changes.
+ * - Valid UTF-8 up to TEXT_SANITIZE_MAX_BYTES is text: `sanitize()` redacts it in place. Returns `raw` itself when
+ *   nothing was found.
+ * - Anything else (non-UTF-8, or over the text limit) is byte-scanned with S02's reviewed windowed scanner. A clean
+ *   one returns `raw` unchanged, so it is committed byte-identical. One with ANY hit returns `bytes: null`: the
+ *   caller leaves the file out of the tree and reports it as `workspace.file_skipped` (DEC-037, which supersedes
+ *   the in-place binary redaction of DEC-026). Rewriting bytes inside a binary yields a corrupt artifact that still
+ *   looks valid, which is worse than an honest, auditable omission.
+ *
+ * `scanBytes` is an S02 internal, not part of the public src/redact/index.ts contract, so its use is confined to
+ * this one function.
  */
-export function redactContent(raw: Buffer): { bytes: Buffer; hits: number } {
+export function redactContent(raw: Buffer): { bytes: Buffer | null; hits: number } {
   if (raw.byteLength <= TEXT_SANITIZE_MAX_BYTES && isUtf8(raw)) {
     const { output, hits } = sanitize(raw.toString('utf8'));
     return hits.length === 0 ? { bytes: raw, hits: 0 } : { bytes: Buffer.from(output, 'utf8'), hits: hits.length };
   }
-  const hits = scanBytes(raw);
-  if (hits.length === 0) return { bytes: raw, hits: 0 };
-  const parts: Buffer[] = [];
-  let cursor = 0;
-  for (const hit of [...hits].sort((a, b) => a.offset - b.offset)) {
-    const end = hit.offset + hit.length;
-    if (end <= cursor) continue;
-    parts.push(raw.subarray(cursor, Math.max(cursor, hit.offset)), Buffer.from(redactionMarker(hit.kind), 'utf8'));
-    cursor = end;
-  }
-  parts.push(raw.subarray(cursor));
-  return { bytes: Buffer.concat(parts), hits: hits.length };
+  const hits = scanBytes(raw).length;
+  return hits === 0 ? { bytes: raw, hits: 0 } : { bytes: null, hits };
 }
 
 interface WorkspaceFile {
@@ -240,6 +237,11 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
       }
       hashed += 1;
       const { bytes, hits } = redactContent(raw);
+      if (bytes === null) {
+        // Absent from this checkpoint's tree (and so deleted from the parent's, if it was there), reported once.
+        skipped.push({ path: file.rel, size: file.size, reason: 'secret_detected' });
+        continue;
+      }
       if (hits > 0) redactedFiles += 1;
       const oid = gitBlobId(bytes, options.objectFormat);
       files.set(file.rel, { mode: file.mode, oid, size: file.size, mtimeNs: file.mtimeNs, ino: file.ino, hashedAtNs });

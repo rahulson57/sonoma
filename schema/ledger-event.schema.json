@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ckpt.local/schema/ledger-event.schema.json",
   "title": "LedgerEvent",
-  "description": "SPEC-004 append-only, hash-chained Execution Ledger event. hash = sha256(prev_hash || canonicalJSON(event without hash)); the first event of a run chains from 64 zero hex digits. Exactly one of payload (inline JSON, <= 1 MiB canonical UTF-8) or payload_ref (CAS blob holding the canonical JSON bytes) is non-null. Payloads are open objects so a new adapter needs no schema change.",
+  "description": "SPEC-004 append-only, hash-chained Execution Ledger event. hash = sha256(prev_hash || canonicalJSON(event without hash)); the first event of a run chains from 64 zero hex digits. Exactly one of payload (inline JSON, <= 1 MiB canonical UTF-8) or payload_ref (CAS blob holding the canonical JSON bytes) is non-null. Payloads are open objects so a new adapter needs no schema change. intent_id (SPEC-015 amendment 2) is top-level and part of the hashed event; every event the ledger appends carries it (string or null). It is not required, because events sealed before the amendment do not have the member and are never re-hashed.",
   "type": "object",
   "required": ["event_id", "run_id", "seq", "ts", "type", "actor", "payload", "payload_ref", "prev_hash", "hash"],
   "additionalProperties": false,
@@ -30,15 +30,23 @@
         "side_effect.requested",
         "side_effect.committed",
         "checkpoint.created",
+        "state.declared",
         "agent.interrupted",
+        "agent.suspended",
         "agent.resumed",
         "agent.forked",
         "agent.rolled_back",
         "distill.completed",
-        "export.unsafe"
+        "export.unsafe",
+        "adapter.error",
+        "adapter.unknown_hook"
       ]
     },
     "actor": { "enum": ["agent", "runtime", "human"] },
+    "intent_id": {
+      "description": "Correlates a request (tool.requested, side_effect.requested) with its acknowledgement or failure, even when the payload is offloaded. Mapped from Claude Code tool_use_id.",
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
     "payload": { "type": ["object", "null"] },
     "payload_ref": {
       "anyOf": [{ "$ref": "common.schema.json#/$defs/BlobRef" }, { "type": "null" }]

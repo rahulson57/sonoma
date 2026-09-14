@@ -1,6 +1,10 @@
 /**
  * SQLite metadata index `.ckpt/checkpoint.db` (SPEC-005): runs, checkpoints (with parents), ledger
- * event rows, blob refs and the change-detection cache.
+ * event rows, blob refs, the change-detection cache, and (SPEC-015 amendment 4) projections and their claims.
+ *
+ * Projection and claim rows hold only index columns plus the projection's CAS blob ref. The projection itself,
+ * claim values included, lives only in CAS, which is its source of truth, so no claim text is copied into this
+ * file.
  *
  * NOT a source of truth. Everything here is rebuilt by `reindex()` from runs/, CAS and git refs, so
  * the file can be deleted at any time. WAL journal mode; the database file is created 0600 before
@@ -73,7 +77,45 @@ CREATE TABLE IF NOT EXISTS file_cache (
   hashed_at_ns TEXT NOT NULL,
   PRIMARY KEY (run_id, path)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS checkpoints_by_state ON checkpoints (checkpoint_id, state_hash);
+CREATE TABLE IF NOT EXISTS projections (
+  projection_id TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  n             INTEGER NOT NULL,
+  source        TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  blob_sha256   TEXT NOT NULL,
+  blob_size     INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS projections_by_checkpoint ON projections (run_id, n, created_at, projection_id);
+CREATE TABLE IF NOT EXISTS claims (
+  projection_id TEXT NOT NULL,
+  idx           INTEGER NOT NULL,
+  run_id        TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  field         TEXT NOT NULL,
+  origin        TEXT NOT NULL,
+  PRIMARY KEY (projection_id, idx)
+) WITHOUT ROWID;
 `;
+
+/** One projection's index rows: the projection row and one claim row per claim, in claim order. */
+export interface ProjectionIndexEntry {
+  readonly projection_id: string;
+  readonly run_id: string;
+  readonly checkpoint_id: string;
+  readonly source: string;
+  readonly created_at: string;
+  /** The CAS blob holding the projection's canonical JSON. */
+  readonly ref: BlobRef;
+  readonly claims: ReadonlyArray<{ readonly field: string; readonly origin: string }>;
+}
+
+export interface IndexedProjection {
+  readonly projection_id: string;
+  readonly ref: BlobRef;
+}
 
 export interface IndexCounts {
   readonly runs: number;
@@ -168,6 +210,11 @@ export class IndexDb {
     return row === undefined ? undefined : parseRecord<Run>(row, 'run');
   }
 
+  /** Every indexed run, forks included, by created_at then run_id. */
+  listRuns(): Run[] {
+    return this.#all('SELECT record FROM runs ORDER BY created_at, run_id').map((row) => parseRecord<Run>(row, 'run'));
+  }
+
   // ── events ────────────────────────────────────────────────────────────────────────────────────
 
   insertEvent(event: LedgerEvent): void {
@@ -226,6 +273,63 @@ export class IndexDb {
     return this.#all('SELECT record FROM checkpoints WHERE run_id = ? ORDER BY n', runId).map((row) => parseRecord<Checkpoint>(row, 'checkpoint'));
   }
 
+  /** The checkpoint with this id whose state blob hashes to `stateHash` (the state embeds run and checkpoint ids). */
+  findCheckpointByState(checkpointId: string, stateHash: string): Checkpoint | undefined {
+    const row = this.#get(
+      'SELECT record FROM checkpoints WHERE checkpoint_id = ? AND state_hash = ? ORDER BY run_id LIMIT 1',
+      checkpointId,
+      stateHash,
+    );
+    return row === undefined ? undefined : parseRecord<Checkpoint>(row, 'checkpoint');
+  }
+
+  // ── projections and claims ────────────────────────────────────────────────────────────────────
+
+  insertProjection(entry: ProjectionIndexEntry): void {
+    this.#stmt(
+      `INSERT INTO projections (projection_id, run_id, checkpoint_id, n, source, created_at, blob_sha256, blob_size)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      entry.projection_id,
+      entry.run_id,
+      entry.checkpoint_id,
+      checkpointNumber(entry.checkpoint_id),
+      entry.source,
+      entry.created_at,
+      entry.ref.sha256,
+      entry.ref.size,
+    );
+    entry.claims.forEach((claim, idx) => {
+      this.#stmt('INSERT INTO claims (projection_id, idx, run_id, checkpoint_id, field, origin) VALUES (?, ?, ?, ?, ?, ?)').run(
+        entry.projection_id,
+        idx,
+        entry.run_id,
+        entry.checkpoint_id,
+        claim.field,
+        claim.origin,
+      );
+    });
+  }
+
+  getProjectionRef(projectionId: string): BlobRef | undefined {
+    const row = this.#get('SELECT blob_sha256, blob_size FROM projections WHERE projection_id = ?', projectionId);
+    return row === undefined ? undefined : { sha256: String(row['blob_sha256']), size: Number(row['blob_size']) };
+  }
+
+  /** The projections of one checkpoint, by createdAt then id. */
+  listProjections(runId: string, checkpointId: string): IndexedProjection[] {
+    return this.#all(
+      'SELECT projection_id, blob_sha256, blob_size FROM projections WHERE run_id = ? AND n = ? ORDER BY created_at, projection_id',
+      runId,
+      checkpointNumber(checkpointId),
+    ).map((row) => ({ projection_id: String(row['projection_id']), ref: { sha256: String(row['blob_sha256']), size: Number(row['blob_size']) } }));
+  }
+
+  projectionCounts(): { projections: number; claims: number } {
+    const count = (table: string): number => Number(this.#get(`SELECT COUNT(*) AS n FROM ${table}`)?.['n'] ?? 0);
+    return { projections: count('projections'), claims: count('claims') };
+  }
+
   // ── blobs ─────────────────────────────────────────────────────────────────────────────────────
 
   insertBlob(ref: BlobRef): void {
@@ -241,7 +345,7 @@ export class IndexDb {
 
   /** Drop every indexed row (reindex rebuilds them). */
   clearAll(): void {
-    for (const table of ['runs', 'events', 'checkpoints', 'blobs', 'file_cache']) {
+    for (const table of ['runs', 'events', 'checkpoints', 'blobs', 'file_cache', 'projections', 'claims']) {
       this.#stmt(`DELETE FROM ${table}`).run();
     }
   }
