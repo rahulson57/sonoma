@@ -1,7 +1,7 @@
 /** Checkpoint Engine contract types (SPEC-006 "Contract"). */
 // Type only (DEC-030): the Distiller owns DistillRequest; the engine never imports src/distill at runtime.
 import type { DistillRequest } from '../distill/index.js';
-import type { AgentStateObject, Checkpoint, PendingIntent, SideEffect } from '../model/types.js';
+import type { AgentStateObject, Checkpoint, PendingIntent, SemanticClaim, SideEffect } from '../model/types.js';
 
 /** SPEC-006 `CheckpointRef = { runId: string; checkpointId: string }` (CLI form `run_x:c_17`). */
 export interface CheckpointRef {
@@ -12,6 +12,13 @@ export interface CheckpointRef {
 export interface CheckpointOptions {
   /** A label makes the checkpoint a distillation trigger (fire-and-forget `distillRequest`). */
   readonly label?: string | null;
+  /**
+   * SPEC-006 `declaredState`, from the State SDK (SPEC-010): `agent_declared` claims citing only this run's
+   * `state.declared` event(s) recorded since the parent checkpoint. Checked before any write; values are sanitized and
+   * stored after the checkpoint as its `source: 'declared'` SemanticProjection. That store is NOT atomic with the
+   * checkpoint: if it fails, checkpoint() rejects; if the process dies in between, the checkpoint has no declared claims.
+   */
+  readonly declaredState?: readonly SemanticClaim[] | null;
 }
 
 /** What `resume(ref)` hands back: `{checkpoint, state, worktreePath, pendingIntent}`. */

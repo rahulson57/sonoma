@@ -2,8 +2,10 @@
  * SPEC-010 "Limits": at least one field, no unknown keys, each string ≤ 64 KB, lists ≤ 1000 entries. A rejection is a
  * CkptValidationError naming the offending field.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { Checkpoint, LedgerEvent, LedgerEventDraft } from '../../../src/model/types.js';
 import { CkptValidationError, isCkptValidationError } from '../../../src/sdk/errors.js';
+import { createCkpt, type DeclaredStateEngine, type DeclaredStateInput } from '../../../src/sdk/index.js';
 import {
   MAX_DECLARED_LIST_ENTRIES,
   MAX_DECLARED_STRING_BYTES,
@@ -11,6 +13,37 @@ import {
   validateSaveOptions,
 } from '../../../src/sdk/validate.js';
 import { secretCorpus } from '../../helpers/fakeSecrets.js';
+
+describe('save() rejects invalid input before the Engine is called', () => {
+  function spiedEngine(): { engine: DeclaredStateEngine; record: ReturnType<typeof vi.fn>; checkpoint: ReturnType<typeof vi.fn> } {
+    const record = vi.fn(async (_drafts: readonly LedgerEventDraft[]): Promise<LedgerEvent[]> => []);
+    const checkpoint = vi.fn(async (_runId: string): Promise<Checkpoint> => ({}) as Checkpoint);
+    return { engine: { record, checkpoint }, record, checkpoint };
+  }
+
+  it.each([
+    ['an empty object', {}, 'state'],
+    ['an unknown key', { goal: 'g', mood: 'fine' }, 'mood'],
+    ['a string > 64 KB', { next_action: 'x'.repeat(MAX_DECLARED_STRING_BYTES + 1) }, 'next_action'],
+    ['a list entry > 64 KB', { decisions: ['ok', 'y'.repeat(MAX_DECLARED_STRING_BYTES + 1)] }, 'decisions'],
+  ])('%s rejects with CkptValidationError and the Engine record() spy is called 0 times', async (_name, input, field) => {
+    const { engine, record, checkpoint } = spiedEngine();
+    const ckpt = createCkpt({ engine, runId: 'run_01J00000000000000000000000' });
+    const outcome = ckpt.save(input as DeclaredStateInput);
+    await expect(outcome).rejects.toBeInstanceOf(CkptValidationError);
+    await expect(outcome).rejects.toMatchObject({ field });
+    expect(record).toHaveBeenCalledTimes(0);
+    expect(checkpoint).toHaveBeenCalledTimes(0);
+  });
+
+  it('an invalid label also rejects before the Engine is called', async () => {
+    const { engine, record, checkpoint } = spiedEngine();
+    const ckpt = createCkpt({ engine, runId: 'run_01J00000000000000000000000' });
+    await expect(ckpt.save({ goal: 'g' }, { label: '' })).rejects.toMatchObject({ name: 'CkptValidationError', field: 'label' });
+    expect(record).toHaveBeenCalledTimes(0);
+    expect(checkpoint).toHaveBeenCalledTimes(0);
+  });
+});
 
 function rejection(fn: () => unknown): CkptValidationError {
   try {
