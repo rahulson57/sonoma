@@ -16,10 +16,15 @@
  * ends, it writes `scenario`, `budgetMs` (from the SPEC-002 budget table), `p95Ms` and `phases`
  * (each phase's p95) onto the task result. vitest copies them into the benchmark entry in
  * bench/results.json, where bench/results.schema.ts `readBenchResults()` finds them.
+ *
+ * NOT MEASURED (DEC-049(1), DEC-050): a sample reports a phase it cannot measure as `null`, never `0`.
+ * A phase's p95 is `null` when ANY sample left it unmeasured: a percentile over a subset of the
+ * iterations would present a partial measurement as a whole one.
  */
 import { BUDGETS, isKnownScenario, PHASES, type BenchResult, type Phase, type PhaseTimings } from './results.schema.js';
 
-export type PhaseDurations = Record<Phase, number>;
+/** One sample's per-phase durations in milliseconds; `null` = not measured in this sample. */
+export type PhaseDurations = Record<Phase, number | null>;
 
 export interface CheckpointSample {
   /** `checkpoint()` call to ACK, in milliseconds. */
@@ -42,12 +47,30 @@ function assertDuration(label: string, value: unknown): asserts value is number 
   }
 }
 
+function assertPhaseDuration(label: string, value: unknown): asserts value is number | null {
+  if (value === null) return;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(`phaseRecorder: ${label} must be a finite number >= 0, or null when not measured, got ${String(value)}`);
+  }
+}
+
+/** p95 of one phase over the samples, or null when any sample did not measure it. */
+function phaseP95(samples: readonly CheckpointSample[], phase: Phase): number | null {
+  const values: number[] = [];
+  for (const sample of samples) {
+    const value = sample.phases[phase];
+    if (value === null) return null;
+    values.push(value);
+  }
+  return percentile(values, 95);
+}
+
 /** Hook shape accepted by vitest `bench()` options (tinybench `setup` / `teardown`). */
 type BenchHook = (task: object, mode: string) => void;
 
 export interface PhaseRecorder {
   readonly scenario: string;
-  /** Record one measured checkpoint. Throws on a missing or invalid phase duration. */
+  /** Record one measured checkpoint. Throws on a missing or invalid phase duration (null is valid). */
   record(sample: CheckpointSample): void;
   /** Spread into `bench()` options. */
   readonly options: { setup: BenchHook; teardown: BenchHook };
@@ -70,9 +93,7 @@ export function phaseRecorder(scenario: string): PhaseRecorder {
     if (samples.length === 0) {
       throw new Error(`phaseRecorder(${scenario}): no samples recorded; call recorder.record() inside the bench function`);
     }
-    const phases = Object.fromEntries(
-      PHASES.map((phase) => [phase, percentile(samples.map((s) => s.phases[phase]), 95)]),
-    ) as PhaseTimings;
+    const phases = Object.fromEntries(PHASES.map((phase) => [phase, phaseP95(samples, phase)])) as PhaseTimings;
     const fields: BenchResult = { scenario, budgetMs, p95Ms: percentile(samples.map((s) => s.totalMs), 95), phases };
     const target = task as { result?: Record<string, unknown> };
     target.result = { ...(target.result ?? {}), ...fields };
@@ -82,7 +103,13 @@ export function phaseRecorder(scenario: string): PhaseRecorder {
     scenario,
     record(sample: CheckpointSample): void {
       assertDuration('totalMs', sample.totalMs);
-      for (const phase of PHASES) assertDuration(`phases.${phase}`, sample.phases?.[phase]);
+      if (typeof sample.phases !== 'object' || sample.phases === null) {
+        throw new RangeError('phaseRecorder: phases must be an object with all 7 SPEC-002 phase keys');
+      }
+      for (const phase of PHASES) {
+        if (!(phase in sample.phases)) throw new RangeError(`phaseRecorder: phases.${phase} is missing (use null when not measured)`);
+        assertPhaseDuration(`phases.${phase}`, sample.phases[phase]);
+      }
       samples.push({ totalMs: sample.totalMs, phases: { ...sample.phases } });
     },
     options: { setup, teardown },

@@ -31,6 +31,7 @@ import { isExcludedPath, sanitize } from '../redact/index.js';
 import { RACY_WINDOW_NS } from '../storage/change-detection.js';
 import { errnoCode } from '../storage/fs-util.js';
 import type { WorkspaceChanges } from '../storage/types.js';
+import type { CheckpointPhase } from './engine.js';
 
 /** SPEC-002 "Single file in snapshot: 1 GB". */
 export const MAX_SNAPSHOT_FILE_BYTES = 1024 * 1024 * 1024;
@@ -82,6 +83,12 @@ export interface SnapshotOptions {
   /** Snapshot policy hook: return false to leave a path (and, for a directory, everything under it) out. */
   readonly include?: ((relPath: string) => boolean) | undefined;
   readonly nowNs: () => bigint;
+  /**
+   * Observe-only phase timings (SPEC-002 "Measurement definition"). Each `buildSnapshot` call reports changeDetection,
+   * scanRedact, hash and blobWrite once, each the sum of its intervals in this call. Reading file content, creating
+   * and removing the staging directory are not attributed to any phase. Unset: nothing is timed or reported.
+   */
+  readonly phaseTimer?: { add(phase: CheckpointPhase, ms: number): void } | undefined;
 }
 
 export interface Snapshot {
@@ -196,12 +203,100 @@ async function stageEntry(root: string, rel: string, mode: TreeMode, bytes: Buff
   if (mode === '100755') await chmod(target, 0o700);
 }
 
+/** The caller's observe-only phase timer: `SnapshotOptions.phaseTimer` when it is set. */
+type PhaseTimer = NonNullable<SnapshotOptions['phaseTimer']>;
+
+/**
+ * Hand one phase's accumulated time to the caller's timer. The timer only observes: if `add()` throws (or is not a
+ * function), the error is caught and ignored HERE, so the snapshot is exactly what it would have been without a timer.
+ */
+function reportPhase(timer: PhaseTimer, phase: CheckpointPhase, ms: number): void {
+  try {
+    timer.add(phase, ms);
+  } catch {
+    // ignored by design: a phase timer never changes a checkpoint's control flow or result
+  }
+}
+
+/** The phases `buildSnapshot` times, in the order they are reported. Storage times the other three. */
+type SnapshotPhase = Extract<CheckpointPhase, 'changeDetection' | 'scanRedact' | 'hash' | 'blobWrite'>;
+const SNAPSHOT_PHASES: readonly SnapshotPhase[] = ['changeDetection', 'scanRedact', 'hash', 'blobWrite'];
+
+/**
+ * `buildSnapshot`'s phase clock. `start()` opens an interval; `lap(phase)` adds the time since the interval opened to
+ * `phase` and opens the next interval at that same instant; `flush()` reports every phase's total once, in
+ * SNAPSHOT_PHASES order. Time between a `lap()` and the next `start()` is attributed to no phase. Intervals never
+ * overlap, so the reported sum never exceeds the wall time of the `buildSnapshot` call.
+ */
+interface PhaseStopwatch {
+  start(): void;
+  lap(phase: SnapshotPhase): void;
+  flush(): void;
+}
+
+const doNothing = (): void => undefined;
+
+/** The stopwatch when no phaseTimer is set: no clock read, no allocation, nothing reported. */
+const NO_STOPWATCH: PhaseStopwatch = { start: doNothing, lap: doNothing, flush: doNothing };
+
+class TimedStopwatch implements PhaseStopwatch {
+  readonly #timer: PhaseTimer;
+  readonly #totals: Record<SnapshotPhase, number> = { changeDetection: 0, scanRedact: 0, hash: 0, blobWrite: 0 };
+  #mark = 0;
+
+  constructor(timer: PhaseTimer) {
+    this.#timer = timer;
+  }
+
+  start(): void {
+    this.#mark = performance.now();
+  }
+
+  lap(phase: SnapshotPhase): void {
+    const now = performance.now();
+    this.#totals[phase] += now - this.#mark;
+    this.#mark = now;
+  }
+
+  flush(): void {
+    for (const phase of SNAPSHOT_PHASES) reportPhase(this.#timer, phase, this.#totals[phase]);
+  }
+}
+
+function stopwatchFor(timer: SnapshotOptions['phaseTimer']): PhaseStopwatch {
+  return timer === undefined ? NO_STOPWATCH : new TimedStopwatch(timer);
+}
+
+/**
+ * Whether the stat cache's entry can stand in for `file` without reading it: the same mode, size, mtime and inode, and
+ * an mtime outside RACY_WINDOW_NS of the moment the cached entry was hashed.
+ */
+function isStatCacheHit(known: SnapshotFile | undefined, file: WorkspaceFile): known is SnapshotFile {
+  return (
+    known !== undefined &&
+    known.mode === file.mode &&
+    known.size === file.size &&
+    known.mtimeNs === file.mtimeNs &&
+    known.ino === file.ino &&
+    file.mtimeNs + RACY_WINDOW_NS < known.hashedAtNs
+  );
+}
+
 /** Build the sanitized staging tree for one checkpoint of `workspaceDir`. The caller must call `cleanup()`. */
 export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot> {
+  // Phase timing (SPEC-002). Without a timer the stopwatch is NO_STOPWATCH, so performance.now() is never called and
+  // nothing is reported.
+  const watch = stopwatchFor(options.phaseTimer);
+  watch.start();
+
+  // changeDetection: walking the workspace and stat-ing every entry.
   const { files: current, skipped } = await listWorkspace(options.workspaceDir, options);
+  watch.lap('changeDetection');
   const stagingDir = await mkdtemp(path.join(options.tmpDir, 'ckpt-stage-'));
   const cleanup = (): Promise<void> => rm(stagingDir, { recursive: true, force: true });
   try {
+    // changeDetection: the tree this checkpoint is compared against (the stat cache, or the parent commit's tree).
+    watch.start();
     const parentCommit = options.parentCommit;
     const cached =
       parentCommit !== null && options.cache?.workspaceDir === options.workspaceDir && options.cache.baseCommit === parentCommit
@@ -213,20 +308,19 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
     const written: string[] = [];
     let hashed = 0;
     let redactedFiles = 0;
+    watch.lap('changeDetection');
     for (const file of current) {
+      // changeDetection: the stat-cache check.
+      watch.start();
       const known = cached?.get(file.rel);
-      if (
-        known !== undefined &&
-        known.mode === file.mode &&
-        known.size === file.size &&
-        known.mtimeNs === file.mtimeNs &&
-        known.ino === file.ino &&
-        file.mtimeNs + RACY_WINDOW_NS < known.hashedAtNs
-      ) {
+      if (isStatCacheHit(known, file)) {
         files.set(file.rel, known);
+        watch.lap('changeDetection');
         continue;
       }
+      watch.lap('changeDetection');
 
+      // Reading the content is not attributed to any phase.
       const hashedAtNs = options.nowNs();
       let raw: Buffer;
       try {
@@ -236,24 +330,37 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
         throw err;
       }
       hashed += 1;
+      // scanRedact: Redaction of the content.
+      watch.start();
       const { bytes, hits } = redactContent(raw);
+      watch.lap('scanRedact');
       if (bytes === null) {
         // Absent from this checkpoint's tree (and so deleted from the parent's, if it was there), reported once.
         skipped.push({ path: file.rel, size: file.size, reason: 'secret_detected' });
         continue;
       }
       if (hits > 0) redactedFiles += 1;
+      // hash: the git blob id of the sanitized content.
       const oid = gitBlobId(bytes, options.objectFormat);
+      watch.lap('hash');
       files.set(file.rel, { mode: file.mode, oid, size: file.size, mtimeNs: file.mtimeNs, ino: file.ino, hashedAtNs });
 
+      // changeDetection: whether the sanitized blob differs from the parent tree. blobWrite: staging it when it does.
       const parent = parentTree.get(file.rel);
-      if (parentCommit === null || parent === undefined || parent.mode !== file.mode || parent.oid !== oid) {
+      const changed = parentCommit === null || parent === undefined || parent.mode !== file.mode || parent.oid !== oid;
+      watch.lap('changeDetection');
+      if (changed) {
         await stageEntry(stagingDir, file.rel, file.mode, bytes);
         written.push(file.rel);
+        watch.lap('blobWrite');
       }
     }
 
+    // changeDetection: the parent tree's paths that are gone.
+    watch.start();
     const changes = parentCommit === null ? undefined : { written, deleted: [...parentTree.keys()].filter((p) => !files.has(p)) };
+    watch.lap('changeDetection');
+    watch.flush();
     return { stagingDir, changes, files, skipped, hashed, redactedFiles, cleanup };
   } catch (err) {
     await cleanup();
