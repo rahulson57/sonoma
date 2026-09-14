@@ -200,6 +200,52 @@ describe('resume()', () => {
       await fx.cleanup();
     }
   });
+
+  it('DEC-032: nested restore: c_1 → call_A → c_2 → resume(c_1) → call_B → c_3 → resume(c_2) → c_4 reports call_A completed in resume(c_2) and in c_4, and never call_B', async () => {
+    const fx = await engineFixture({ files: { 'src/app.ts': 'export const v = 1;\n' } });
+    try {
+      const runId = (await fx.engine.startRun({ agent: 'claude-code' })).run_id;
+      const edit = (id: string): LedgerEventDraft[] => [
+        { run_id: runId, type: 'tool.requested', actor: 'agent', payload: { tool_call_id: id, tool: 'Edit' } } as LedgerEventDraft,
+        { run_id: runId, type: 'tool.completed', actor: 'runtime', payload: { tool_call_id: id, stdout: 'edited\n' } } as LedgerEventDraft,
+      ];
+
+      const c1 = await fx.engine.checkpoint(runId);
+      expect(c1).toMatchObject({ checkpoint_id: 'c_1' });
+
+      // First history: call_A edits and is acknowledged, then c_2.
+      await writeFiles(fx.repo.dir, { 'src/app.ts': 'export const v = 2; // call_A\n' });
+      await fx.engine.record(edit('call_A'));
+      const c2 = await fx.engine.checkpoint(runId);
+      expect(c2).toMatchObject({ checkpoint_id: 'c_2', parent_checkpoint_id: 'c_1' });
+
+      // resume(c_1) abandons call_A; a second history: call_B edits and is acknowledged, then c_3.
+      const atC1 = await fx.engine.resume({ runId, checkpointId: 'c_1' });
+      expect(atC1.pendingIntent.some((intent) => intent.intent_id === 'call_A')).toBe(false);
+      await writeFiles(atC1.worktreePath, { 'src/app.ts': 'export const v = 3; // call_B\n' });
+      await fx.engine.record(edit('call_B'));
+      const c3 = await fx.engine.checkpoint(runId);
+      expect(c3).toMatchObject({ checkpoint_id: 'c_3', parent_checkpoint_id: 'c_1' });
+
+      // resume(c_2): c_2 was taken BEFORE the resume(c_1). Its history contains call_A and never contained call_B.
+      const atC2 = await fx.engine.resume({ runId, checkpointId: 'c_2' });
+      expect(await readFile(path.join(atC2.worktreePath, 'src', 'app.ts'), 'utf8')).toBe('export const v = 2; // call_A\n');
+      // (a) resume(c_2) reports call_A completed.
+      expect(intentPairs(atC2.pendingIntent)).toEqual([['tool', 'call_A', 'completed']]);
+      // (c) call_B is not reported (so not completed).
+      expect(atC2.pendingIntent.some((intent) => intent.intent_id === 'call_B')).toBe(false);
+
+      const c4 = await fx.engine.checkpoint(runId);
+      expect(c4).toMatchObject({ checkpoint_id: 'c_4', parent_checkpoint_id: 'c_2' });
+      const state4 = await fx.backend.getState({ run_id: runId, checkpoint_id: 'c_4' });
+      // (b) c_4's recorded state reports call_A completed. A literal union of every restore window loses it here.
+      expect(intentPairs(state4.pending_intent)).toEqual([['tool', 'call_A', 'completed']]);
+      // (c) call_B is not reported (so not completed).
+      expect(state4.pending_intent.some((intent) => intent.intent_id === 'call_B')).toBe(false);
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
 
 type Fixture = Awaited<ReturnType<typeof engineFixture>>;
