@@ -28,7 +28,6 @@ const MISSING_ARGUMENTS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['export --unsafe without a target', ['export', '--unsafe']],
   ['import without a bundle path', ['import']],
   ['distill without a checkpoint id', ['distill']],
-  ['hook without an event', ['hook']],
 ];
 
 const BAD_ARGUMENTS: ReadonlyArray<readonly [string, readonly string[]]> = [

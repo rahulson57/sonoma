@@ -1,6 +1,7 @@
 /**
  * Argument parsing for `ckpt <command> [args] [flags]` (SPEC-013 "Commands"). Pure: no I/O and no module calls.
- * Anything malformed throws UsageError, which main() turns into exit 2 with the usage text on stderr.
+ * Anything malformed throws UsageError, which main() turns into exit 2 with the usage text on stderr. The one exception
+ * is the adapter-internal `ckpt hook`, which never fails parsing (DEC-066).
  */
 import type { ExportTarget } from '../bundle/index.js';
 import { parseCheckpointRef, type CheckpointRef } from '../engine/index.js';
@@ -59,12 +60,6 @@ export const COMMANDS = {
 } as const satisfies Record<string, CommandSpec>;
 
 export type CommandName = keyof typeof COMMANDS;
-
-/**
- * `ckpt hook <event>`: invoked by the hooks the Claude Code Adapter installs (SPEC-009 installHooks), not by users, so it
- * is not in the usage text. Tracked as challenge 01a09f37 on SPEC-013.
- */
-const HOOK: CommandSpec = { usage: 'ckpt hook <event>', summary: '', positionals: [1, 1], flags: [] };
 
 export function usageText(): string {
   const specs: readonly CommandSpec[] = Object.values(COMMANDS);
@@ -191,7 +186,10 @@ export function parseArgs(argv: readonly string[]): Invocation {
   if (command === undefined || command === '') throw new UsageError('missing command');
   if (command === 'help' || command === '--help' || command === '-h') return { command: 'help' };
   if (command === 'run') return parseRun(rest);
-  if (command === 'hook') return { command: 'hook', event: splitTokens('hook', HOOK, rest).positionals[0] ?? '' };
+  // `ckpt hook <event>` is run by the hooks the Claude Code Adapter installs (SPEC-009), not by users, so it is not in
+  // the usage text. It never fails parsing (DEC-066): Claude Code reads a hook's exit 2 as "block the tool call". So a
+  // missing or unknown event, extra arguments and flags all pass through, and the adapter records what it cannot use.
+  if (command === 'hook') return { command: 'hook', event: rest[0] ?? '' };
   if (!Object.hasOwn(COMMANDS, command)) throw new UsageError(`unknown command ${JSON.stringify(command)}`);
   const name = command as Exclude<CommandName, 'run'>;
   return build(name, splitTokens(name, COMMANDS[name], rest));

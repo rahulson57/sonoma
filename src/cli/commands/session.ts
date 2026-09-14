@@ -24,12 +24,14 @@ export function ui(invocation: InvocationOf<'ui'>, deps: CliDeps): Promise<ExitC
 }
 
 /**
- * `ckpt hook <event>`: what the hooks installed by the Claude Code Adapter run (SPEC-009 installHooks). The payload
- * arrives on stdin and goes to the adapter's handleHook unparsed.
+ * `ckpt hook <event>`: what the hooks installed by the Claude Code Adapter run (SPEC-009 installHooks, DEC-066). The
+ * payload arrives on stdin and goes to the adapter's handleHook unparsed, so malformed input is recorded as
+ * adapter.error or adapter.unknown_hook.
  *
- * A hook must never block or fail the agent's tool call, so this always exits 0. The adapter records its own failures as
- * adapter.error. A failure before it can run, such as a store that cannot be opened, becomes one stderr line naming the
- * error kind only. The error message could echo payload bytes, so it is never printed.
+ * Claude Code treats a hook's exit 2 as "block the tool call", and it adds SessionStart and UserPromptSubmit hook stdout
+ * to the model's context. So this path always exits 0 and never writes stdout. The adapter records its own failures. A
+ * failure before it can run, such as unreadable stdin or a store that cannot be opened, becomes one stderr line in the
+ * adapter's notice format. That line names the error kind only: the message could echo payload bytes.
  */
 export async function hook(invocation: InvocationOf<'hook'>, deps: CliDeps): Promise<ExitCode> {
   // Plain `claude` with hooks installed but outside `ckpt run claude`: nothing to record, and no store is opened.
