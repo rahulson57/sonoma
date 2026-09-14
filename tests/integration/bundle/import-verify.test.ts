@@ -186,6 +186,20 @@ describe('import verification of re-sealed and padded bundles', () => {
         objects: async () => [commitObject(await sourceObject(`${checkpoints[0]!.workspace_commit}^{tree}`), [await destinationObject(`${own.workspace_commit}^{tree}`)])],
         pattern: /as a commit, but it is a tree/,
       },
+      {
+        // One object this repository already has (D), reached under two types. The walk pops the commit's
+        // parent before its tree, so D's CORRECT expectation (commit) is recorded first and the wrong one (blob,
+        // via the tree entry) second. That order is the point: it fails if only the first expected type of an
+        // external object is kept. If the walk order ever changes, keep the correct reference first, or this
+        // case silently becomes a duplicate of the "commit whose tree is a blob already in this repository" case.
+        name: 'a tree whose regular-file entry is a commit already in this repository, which is also the parent',
+        objects: async () => {
+          const destinationCommit = await destinationObject(own.workspace_commit);
+          const tree = treeObject('100644', 'file.txt', destinationCommit);
+          return [tree, commitObject(gitObjectId(tree), [destinationCommit])];
+        },
+        pattern: /as a blob, but it is a commit/,
+      },
     ];
 
     it.each(cases)('$name is rejected before any write', async ({ objects, pattern }) => {
