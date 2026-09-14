@@ -15,7 +15,7 @@ export {
   type IntentGroup,
   type RenderedStatus,
 } from './intents.js';
-export { LineageReader, MAX_LINEAGE_DEPTH, checkpointKey } from './lineage.js';
+export { LineageReader, checkpointKey } from './lineage.js';
 export {
   CLAIM_SECTIONS,
   NO_SEMANTIC_STATE,

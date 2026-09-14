@@ -13,7 +13,7 @@ import type { Checkpoint, SemanticClaim } from '../model/types.js';
 import { validateSemanticClaim, validateSemanticProjection } from '../model/validate.js';
 import { corrupt } from './errors.js';
 import { isRecord } from './guards.js';
-import { MAX_LINEAGE_DEPTH, checkpointKey, type LineageReader } from './lineage.js';
+import { checkpointKey, type LineageReader } from './lineage.js';
 import type { ClaimSource } from './types.js';
 
 export interface ClaimSelection {
@@ -49,6 +49,11 @@ async function claimsRecordedAt(source: ClaimSource, checkpoint: Checkpoint): Pr
   return [...(projections.at(-1)?.claims ?? []), ...declared];
 }
 
+/**
+ * Walks the lineage until a checkpoint has claims or the lineage ends. There is no depth limit, so a valid lineage of any
+ * length resolves. The walk still ends: same-run parents have strictly lower cursors (LineageReader), and a checkpoint
+ * reached twice, which only fork records pointing in a circle can cause, raises ERR_CORRUPT.
+ */
 export async function selectClaims(source: ClaimSource | undefined, lineage: LineageReader, checkpoint: Checkpoint): Promise<ClaimSelection> {
   if (source === undefined) return { source: null, claims: [] };
   const visited = new Set<string>();
@@ -56,7 +61,6 @@ export async function selectClaims(source: ClaimSource | undefined, lineage: Lin
   while (current !== null) {
     const key = checkpointKey(current);
     if (visited.has(key)) throw corrupt(`the lineage of ${checkpointKey(checkpoint)} returns to ${key}`);
-    if (visited.size >= MAX_LINEAGE_DEPTH) throw corrupt(`the lineage of ${checkpointKey(checkpoint)} is deeper than ${MAX_LINEAGE_DEPTH} checkpoints`);
     visited.add(key);
     const claims = await claimsRecordedAt(source, current);
     if (claims.length > 0) return { source: current, claims };

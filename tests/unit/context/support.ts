@@ -126,7 +126,8 @@ export class MemoryStorage implements ContextStorage {
   readonly ranges: Array<{ readonly runId: string; readonly fromSeq: number; readonly toSeq: number }> = [];
   readonly checkpointReads: CheckpointRef[] = [];
   readonly #events = new Map<string, LedgerEvent[]>();
-  readonly #checkpoints: readonly Checkpoint[];
+  /** Keyed `run_id:checkpoint_id`, first occurrence wins, so deep lineages read in constant time per checkpoint. */
+  readonly #checkpoints = new Map<string, Checkpoint>();
 
   constructor(events: readonly LedgerEvent[], checkpoints: readonly Checkpoint[]) {
     for (const event of events) {
@@ -140,7 +141,10 @@ export class MemoryStorage implements ContextStorage {
         if (event.seq !== index + 1) throw new Error(`MemoryStorage: ledger of ${event.run_id} is not contiguous from seq 1`);
       });
     }
-    this.#checkpoints = checkpoints;
+    for (const checkpoint of checkpoints) {
+      const key = keyOf(checkpoint);
+      if (!this.#checkpoints.has(key)) this.#checkpoints.set(key, checkpoint);
+    }
   }
 
   async getEvents(runId: string, range: { fromSeq: number; toSeq: number }): Promise<LedgerEvent[]> {
@@ -151,7 +155,7 @@ export class MemoryStorage implements ContextStorage {
 
   async getCheckpoint(ref: CheckpointRef): Promise<Checkpoint> {
     this.checkpointReads.push(ref);
-    const found = this.#checkpoints.find((cp) => cp.run_id === ref.run_id && cp.checkpoint_id === ref.checkpoint_id);
+    const found = this.#checkpoints.get(`${ref.run_id}:${ref.checkpoint_id}`);
     if (found === undefined) throw new Error(`MemoryStorage: no checkpoint ${ref.run_id}:${ref.checkpoint_id}`);
     return found;
   }

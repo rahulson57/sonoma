@@ -25,6 +25,8 @@ import {
 
 const RUN_A = RUN_ID;
 const RUN_B = `run_${'0'.repeat(25)}B`;
+const RUN_C = `run_${'0'.repeat(25)}C`;
+const RUN_D = `run_${'0'.repeat(25)}D`;
 
 const a1 = checkpointAt({ n: 1, ledgerSeq: 4 });
 const a2 = checkpointAt({ n: 2, ledgerSeq: 6, parent: a1 });
@@ -173,6 +175,67 @@ describe('claim selection by lineage', () => {
       .catch((err: unknown) => err);
     expect(isContextError(error, 'ERR_CORRUPT')).toBe(true);
   });
+
+  it('resolves a valid lineage deeper than 10,000 checkpoints with claims only at its root: no depth limit', async () => {
+    const depth = 10_050;
+    const drafts: Draft[] = [{ type: 'run.created', payload: { agent: 'claude-code' } }];
+    for (let n = 1; n <= depth; n += 1) drafts.push({ type: 'checkpoint.created', payload: { checkpoint_id: `c_${n}` } });
+    const events = sealEvents(drafts);
+    // c_n sits at seq n + 1, its parent is c_(n-1): one run, strictly rising cursors, no fork.
+    const root = checkpointAt({ n: 1, ledgerSeq: 2 });
+    const chain: Checkpoint[] = [root];
+    let deepest = root;
+    for (let n = 2; n <= depth; n += 1) {
+      deepest = checkpointAt({ n, ledgerSeq: n + 1, parent: deepest });
+      chain.push(deepest);
+    }
+    const source = claimTable({ [keyOf(root)]: { projections: [[claim('goal', 'Root goal', [events[0]?.event_id ?? ''])]] } });
+
+    const context = await createContextBuilder({ storage: new MemoryStorage(events, chain), git: fakeGit(), claims: source }).buildResumeContext(
+      restoredAt(deepest, events),
+      { maxTokens: 8000 },
+    );
+
+    expect(source.asked).toHaveLength(depth);
+    expect(source.asked[0]).toBe(keyOf(deepest));
+    expect(source.asked.at(-1)).toBe(keyOf(root));
+    expect(context.systemPreamble).toContain(`semantic state source: checkpoint ${RUN_ID}:c_1 (ledger cursor seq 2), the nearest earlier checkpoint`);
+    expect(sectionLines(context.systemPreamble, 'goal')[0]).toBe('  - Root goal');
+    expect(context.hydratedEvents[0]?.seq).toBe(1);
+    expect(context.tokenEstimate).toBeLessThanOrEqual(8000);
+  });
+
+  it('refuses a fork cycle across runs (ERR_CORRUPT) instead of walking it forever', async () => {
+    // C:c_1 is recorded as forked from D:c_1, and D:c_1 as forked from C:c_1; each fork event matches its source's cursor and commit.
+    const c1 = checkpointAt({ n: 1, ledgerSeq: 2, runId: RUN_C });
+    const d1 = checkpointAt({ n: 1, ledgerSeq: 2, runId: RUN_D });
+    const forkedFrom = (source: Checkpoint): Draft[] => [
+      {
+        type: 'agent.forked',
+        payload: { parent_run_id: source.run_id, forked_from_checkpoint: source.checkpoint_id, ledger_seq: source.ledger_seq, workspace_commit: source.workspace_commit },
+      }, // 1
+      { type: 'checkpoint.created', payload: { checkpoint_id: 'c_1' } }, // 2
+    ];
+    const eventsC = sealEvents(forkedFrom(d1), RUN_C);
+    const eventsD = sealEvents(forkedFrom(c1), RUN_D);
+    const asked: string[] = [];
+    const guarded: ClaimSource = {
+      async claimsAt(checkpoint) {
+        asked.push(keyOf(checkpoint));
+        // Without cycle detection the walk would never end: fail loudly instead of hanging.
+        if (asked.length > 10) throw new Error('the lineage walk did not stop at the cycle');
+        return { projections: [], declared: [] };
+      },
+    };
+
+    const error = await createContextBuilder({ storage: new MemoryStorage([...eventsC, ...eventsD], [c1, d1]), git: fakeGit(), claims: guarded })
+      .buildResumeContext(restoredAt(c1, eventsC))
+      .catch((err: unknown) => err);
+
+    expect(isContextError(error, 'ERR_CORRUPT')).toBe(true);
+    expect(error instanceof Error ? error.message : '').toContain(`the lineage of ${RUN_C}:c_1 returns to ${RUN_C}:c_1`);
+    expect(asked).toEqual([keyOf(c1), keyOf(d1)]);
+  });
 });
 
 describe('claims under the budget', () => {
@@ -196,6 +259,29 @@ describe('claims under the budget', () => {
 
     const roomy = await builder.buildResumeContext(restoredOf(a1), { maxTokens: 32000 });
     expect(sectionLines(roomy.systemPreamble, 'assumptions').filter((line) => line.startsWith('  - Assumption'))).toHaveLength(40);
+    expect(roomy.systemPreamble).not.toContain('more claims omitted');
+  });
+
+  it('skips an optional claim that does not fit whole and still shows smaller claims after it (skip-and-continue)', async () => {
+    const huge = claim('assumption', `Huge assumption: ${'the cache stays warm and consistent '.repeat(400)}`, [evtA(2)]);
+    const smallAssumption = claim('assumption', 'Small assumption after the huge one', [evtA(2)]);
+    const decision = claim('decision', 'Keep the ledger append-only', [evtA(2)]);
+    const builder = builderWith(staticClaims([claim('goal', 'Ship the resume demo', [evtA(2)]), huge, smallAssumption, decision]));
+
+    const tight = await builder.buildResumeContext(restoredOf(a1), { maxTokens: 2000 });
+
+    expect(tight.tokenEstimate).toBeLessThanOrEqual(2000);
+    expect(tight.systemPreamble).not.toContain('Huge assumption');
+    // The huge claim (claim order 1) is left out and counted; the claims after it in claim order are still tried and fit.
+    expect(sectionLines(tight.systemPreamble, 'assumptions')).toEqual([
+      '  - Small assumption after the huge one',
+      expect.stringContaining('    (origin distilled;'),
+      '  - 1 more claims omitted: they do not fit the token budget',
+    ]);
+    expect(sectionLines(tight.systemPreamble, 'decisions')).toEqual(['  - Keep the ledger append-only', expect.stringContaining('    (origin distilled;')]);
+
+    const roomy = await builder.buildResumeContext(restoredOf(a1), { maxTokens: 32000 });
+    expect(roomy.systemPreamble).toContain('Huge assumption');
     expect(roomy.systemPreamble).not.toContain('more claims omitted');
   });
 

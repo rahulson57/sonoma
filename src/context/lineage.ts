@@ -10,15 +10,17 @@
  * empty ledger and appends that event before anything else can. Its payload names the source (parent_run_id,
  * forked_from_checkpoint, ledger_seq, workspace_commit), so crossing a fork needs only getEvents and getCheckpoint.
  * The seq-1 read lies inside [1, cursor] of every checkpoint of that run.
+ *
+ * There is no depth limit: a valid lineage of any length resolves (SPEC-002's numbers are an envelope, not a cap). A walk
+ * still ends. Within a run each parent's cursor must be strictly lower than its child's (#loadParent refuses anything
+ * else), so a same-run chain cannot repeat. Across runs, a walk that reaches a checkpoint twice has followed fork
+ * records that point in a circle, and selectClaims raises ERR_CORRUPT.
  */
 import type { Checkpoint } from '../model/types.js';
 import { validateCheckpoint } from '../model/validate.js';
 import { corrupt } from './errors.js';
 import { isRecord } from './guards.js';
 import type { ContextStorage } from './types.js';
-
-/** More checkpoints than this on one lineage is treated as corrupt (a cycle, or records that point in circles). */
-export const MAX_LINEAGE_DEPTH = 10_000;
 
 export function checkpointKey(checkpoint: Checkpoint): string {
   return `${checkpoint.run_id}:${checkpoint.checkpoint_id}`;

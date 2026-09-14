@@ -39,6 +39,9 @@ function toolRun(): LedgerEvent[] {
   return sealEvents(drafts);
 }
 
+/** A budget at which the failed-first fixture below lists some, but not all, of its failed tool intents. */
+const PARTIAL_BOUNDED_TOKENS = 1200;
+
 function inGroup(intents: readonly PendingIntent[], group: IntentGroup): PendingIntent[] {
   return intents.filter((intent) => intentGroup(intent) === group);
 }
@@ -151,6 +154,74 @@ describe('Tier 1 pending-intent bound (DEC-034)', () => {
     expect(mail).toContain('[recorded after this checkpoint]');
     // Nothing past the cursor is hydrated.
     expect(context.hydratedEvents.every((event) => event.seq <= c1.ledger_seq)).toBe(true);
+  });
+
+  it('skips a newer bounded tool intent that does not fit whole and lists an older, smaller one of the same group (skip-and-continue)', async () => {
+    const hugeId = `call_huge_${'x'.repeat(12_000)}`;
+    const events = sealEvents([
+      { type: 'run.created', payload: { agent: 'claude-code' } }, // 1
+      { type: 'tool.requested', actor: 'agent', payload: { tool_call_id: 'call_small', tool: 'Bash' } }, // 2
+      { type: 'tool.failed', payload: { tool_call_id: 'call_small', error: 'exit 1' } }, // 3
+      { type: 'tool.requested', actor: 'agent', payload: { tool_call_id: hugeId, tool: 'Bash' } }, // 4
+      { type: 'tool.failed', payload: { tool_call_id: hugeId, error: 'exit 1' } }, // 5
+      { type: 'checkpoint.created', payload: { checkpoint_id: 'c_1' } }, // 6
+    ]);
+    const checkpoint = checkpointAt({ n: 1, ledgerSeq: events.length });
+    const restored = restoredAt(checkpoint, events);
+    expect(restored.state.pending_intent.map((intent) => [intent.intent_id, intentGroup(intent)])).toEqual([
+      ['call_small', 'pending'],
+      [hugeId, 'pending'],
+    ]);
+    const builder = createContextBuilder({ storage: new MemoryStorage(events, [checkpoint]), git: fakeGit() });
+
+    const tight = await builder.buildResumeContext(restored, { maxTokens: 2000 });
+
+    expect(tight.tokenEstimate).toBeLessThanOrEqual(2000);
+    // The newest failed intent is tried first and does not fit whole; the older, smaller one is still tried and listed.
+    expect(tight.state.pending_intent.map((intent) => intent.intent_id)).toEqual(['call_small']);
+    expect(sectionLines(tight.systemPreamble, 'pending').filter((line) => line.includes('; not done'))).toEqual([expect.stringContaining('tool call_small,')]);
+    expect(omittedCount(tight.systemPreamble, 'failed tool actions')).toBe(1);
+
+    const roomy = await builder.buildResumeContext(restored, { maxTokens: 32000 });
+    expect(roomy.state.pending_intent.map((intent) => intent.intent_id)).toEqual(['call_small', hugeId]);
+    expect(omittedCount(roomy.systemPreamble, 'failed tool actions')).toBe(0);
+  });
+
+  it('fills the failed group before any completed tool intent when the budget fits only part of the bounded intents', async () => {
+    const drafts: Draft[] = [{ type: 'run.created', payload: { agent: 'claude-code' } }];
+    for (let i = 1; i <= 30; i += 1) {
+      // Completed ids are padded so every completed intent is larger than any failed one: once a failed intent has not
+      // fit, the room left can hold no completed intent either, whatever the order of the two groups' sizes by seq.
+      const done = `call_done_${String(i).padStart(2, '0')}_${'d'.repeat(80)}`;
+      drafts.push({ type: 'tool.requested', actor: 'agent', payload: { tool_call_id: done, tool: 'Bash' } });
+      drafts.push({ type: 'tool.completed', payload: { tool_call_id: done, exit_code: 0 } });
+      if (i > 25) continue;
+      const failed = `call_fail_${String(i).padStart(2, '0')}`;
+      drafts.push({ type: 'tool.requested', actor: 'agent', payload: { tool_call_id: failed, tool: 'Bash' } });
+      drafts.push({ type: 'tool.failed', payload: { tool_call_id: failed, error: 'exit 1' } });
+    }
+    drafts.push({ type: 'checkpoint.created', payload: { checkpoint_id: 'c_1' } });
+    const events = sealEvents(drafts);
+    const checkpoint = checkpointAt({ n: 1, ledgerSeq: events.length });
+    const restored = restoredAt(checkpoint, events);
+    expect(inGroup(restored.state.pending_intent, 'pending')).toHaveLength(25);
+    expect(inGroup(restored.state.pending_intent, 'completed')).toHaveLength(30);
+
+    const context = await createContextBuilder({ storage: new MemoryStorage(events, [checkpoint]), git: fakeGit() }).buildResumeContext(restored, {
+      maxTokens: PARTIAL_BOUNDED_TOKENS,
+    });
+
+    expect(context.tokenEstimate).toBeLessThanOrEqual(PARTIAL_BOUNDED_TOKENS);
+    const listed = context.state.pending_intent;
+    const failedListed = inGroup(listed, 'pending').length;
+    // The budget holds part of the failed group only: some listed, fewer than the cap, so the rest did not fit.
+    expect(failedListed).toBeGreaterThan(0);
+    expect(failedListed).toBeLessThan(PENDING_TOOL_INTENT_CAP);
+    expect(listed.map((intent) => intent.intent_id)).toContain('call_fail_25');
+    // DEC-034(2): failed before completed, so no completed intent is listed.
+    expect(inGroup(listed, 'completed')).toEqual([]);
+    expect(omittedCount(context.systemPreamble, 'failed tool actions')).toBe(25 - failedListed);
+    expect(omittedCount(context.systemPreamble, 'completed tool actions')).toBe(30);
   });
 
   it('rejects with ERR_BUDGET only when the never-dropped intents alone do not fit', async () => {
