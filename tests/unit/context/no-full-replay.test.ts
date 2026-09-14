@@ -27,13 +27,17 @@ describe('no full replay', () => {
       const context = await builder.buildResumeContext(restored, { maxTokens });
       const seqs = context.hydratedEvents.map((event) => event.seq);
 
-      expect(context.hydratedEvents.length).toBeGreaterThan(0);
       expect(context.hydratedEvents.length).toBeLessThan(LEDGER_SIZE);
+      expect(context.tokenEstimate).toBeLessThanOrEqual(maxTokens);
       expect(seqs.every((seq) => seq >= 1 && seq <= cursor)).toBe(true);
       expect(new Set(context.hydratedEvents.map((event) => event.event_id)).size).toBe(context.hydratedEvents.length);
-      // Cited provenance inside the cursor is hydrated; a citation past the cursor is never read into the context.
-      expect(context.hydratedEvents[0]?.event_id).toBe(early.event_id);
       expect(context.hydratedEvents.some((event) => event.event_id === beyond.event_id)).toBe(false);
+      // Bounded tool intents go ahead of Tier 3 (DEC-034(2)); from 8000 up there is room for Tier 3.
+      if (maxTokens > 2000) {
+        expect(context.hydratedEvents.length).toBeGreaterThan(0);
+        // Cited provenance inside the cursor is hydrated first; a citation past the cursor is never read into the context.
+        expect(context.hydratedEvents[0]?.event_id).toBe(early.event_id);
+      }
     }
 
     expect(storage.ranges.length).toBeGreaterThan(0);

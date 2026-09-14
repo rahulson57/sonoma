@@ -1,11 +1,12 @@
 /**
  * Unit fixtures for the Context Builder (SPEC-008): hash-chained ledger events, checkpoints and states that pass
- * the SPEC-004 validators, an in-memory read-only storage that records every range it is asked for, and a fake
- * git diff. No filesystem, git process, clock or network.
+ * the SPEC-004 validators, an in-memory read-only storage that records every range it is asked for, fake claim
+ * sources and a fake git diff. No filesystem, git process, clock or network.
  */
 import { createHash } from 'node:crypto';
 import type { ClaimSource, ContextGit, ContextStorage, RestoredCheckpointInput, ResumeContext } from '../../../src/context/index.js';
 import type { NameStatus } from '../../../src/engine/types.js';
+import { canonicalJSON } from '../../../src/ledger/canonical-json.js';
 import { GENESIS_PREV_HASH, chainHash } from '../../../src/ledger/hash.js';
 import { derivePendingIntent } from '../../../src/ledger/pending-intent.js';
 import type {
@@ -20,6 +21,7 @@ import type {
   PendingIntent,
   SemanticClaim,
   SemanticField,
+  SemanticProjection,
 } from '../../../src/model/types.js';
 import type { CheckpointRef } from '../../../src/storage/types.js';
 import { fakeLedgerEvents } from '../../helpers/ledger.js';
@@ -114,6 +116,11 @@ export function restoredAt(checkpoint: Checkpoint, events: readonly LedgerEvent[
   return { checkpoint, state: stateFor(checkpoint, derivePendingIntent(upTo)), worktreePath: WORKTREE, ...extra };
 }
 
+/** The list the builder renders: the engine's pendingIntent when supplied, else state.pending_intent (DEC-036(2)). */
+export function renderedList(restored: RestoredCheckpointInput): readonly PendingIntent[] {
+  return restored.pendingIntent ?? restored.state.pending_intent;
+}
+
 /** Read-only in-memory storage. Records every getEvents range and getCheckpoint ref. */
 export class MemoryStorage implements ContextStorage {
   readonly ranges: Array<{ readonly runId: string; readonly fromSeq: number; readonly toSeq: number }> = [];
@@ -166,13 +173,54 @@ export function claim(field: SemanticField, value: string, eventIds: readonly st
   return { field, value, origin, provenance: { event_ids: [...eventIds], artifact_refs: [], workspace_paths: [], checkpoint_ids: [] } };
 }
 
+export function keyOf(checkpoint: Checkpoint): string {
+  return `${checkpoint.run_id}:${checkpoint.checkpoint_id}`;
+}
+
+/** A valid SemanticProjection of `checkpoint` holding `claims`. */
+export function projectionOf(checkpoint: Checkpoint, claims: readonly SemanticClaim[], id = `proj_${keyOf(checkpoint)}`): SemanticProjection {
+  return {
+    id,
+    checkpointId: checkpoint.checkpoint_id,
+    distiller: { provider: 'fake', model: 'fake-model', promptVersion: 'distill-v1' },
+    input: { stateHash: checkpoint.state_hash, ledgerRange: [0, checkpoint.ledger_seq], workspaceCommit: checkpoint.workspace_commit },
+    claims: [...claims],
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    createdAt: new Date(START_MS).toISOString(),
+  };
+}
+
+/** Every checkpoint has one projection holding `claims`. Records every checkpoint asked. */
 export function staticClaims(claims: readonly SemanticClaim[]): ClaimSource & { readonly checkpoints: Checkpoint[] } {
   const checkpoints: Checkpoint[] = [];
   return {
     checkpoints,
-    async claimsFor(checkpoint: Checkpoint) {
+    async claimsAt(checkpoint: Checkpoint) {
       checkpoints.push(checkpoint);
-      return claims;
+      return { projections: [projectionOf(checkpoint, claims)], declared: [] };
+    },
+  };
+}
+
+export interface RecordedClaims {
+  /** Claims of each projection, oldest projection first. */
+  readonly projections?: ReadonlyArray<readonly SemanticClaim[]>;
+  readonly declared?: readonly SemanticClaim[];
+}
+
+/** Claims recorded per checkpoint, keyed `run_id:checkpoint_id`; every other checkpoint has none. Records each key asked. */
+export function claimTable(table: Readonly<Record<string, RecordedClaims>>): ClaimSource & { readonly asked: string[] } {
+  const asked: string[] = [];
+  return {
+    asked,
+    async claimsAt(checkpoint: Checkpoint) {
+      const key = keyOf(checkpoint);
+      asked.push(key);
+      const entry = table[key];
+      return {
+        projections: (entry?.projections ?? []).map((claims, index) => projectionOf(checkpoint, claims, `proj_${key}_${index}`)),
+        declared: [...(entry?.declared ?? [])],
+      };
     },
   };
 }
@@ -191,8 +239,14 @@ export function sectionLines(preamble: string, heading: string): string[] {
   return out;
 }
 
-/** The character count tokenEstimate is defined over: JSON of every member except tokenEstimate. */
+/** The character count tokenEstimate is defined over (DEC-036(4)): canonical JSON of every member except tokenEstimate. */
 export function contextChars(context: ResumeContext, hydratedEvents: readonly LedgerEvent[] = context.hydratedEvents): number {
   const { systemPreamble, state, workspaceCommit } = context;
-  return JSON.stringify({ systemPreamble, state, workspaceCommit, hydratedEvents }).length;
+  return canonicalJSON({ systemPreamble, state, workspaceCommit, hydratedEvents }).length;
+}
+
+/** The omitted count a preamble line states, or 0 when there is no such line. */
+export function omittedCount(preamble: string, what: 'completed tool actions' | 'failed tool actions'): number {
+  const match = new RegExp(` {2}- (\\d+) ${what} omitted`).exec(preamble);
+  return Number(match?.[1] ?? 0);
 }

@@ -4,7 +4,8 @@
  * not as the last failure, and not as cited provenance. Nested restores reinstate the restored checkpoint's history.
  */
 import { describe, expect, it } from 'vitest';
-import { createContextBuilder, restoreTarget } from '../../../src/context/index.js';
+import { createContextBuilder, lineageMark } from '../../../src/context/index.js';
+import { abandonedWindows, type LineageMark } from '../../../src/engine/resume-intent.js';
 import type { LedgerEvent } from '../../../src/model/types.js';
 import { MemoryStorage, RUN_ID, checkpointAt, claim, fakeGit, restoredAt, sealEvents, staticClaims, type Draft } from './support.js';
 
@@ -42,12 +43,18 @@ function claimsCitingCallAAndCallB(): ReturnType<typeof staticClaims> {
 }
 
 describe('abandoned windows', () => {
-  it('reads restore targets only from well-formed restore events', () => {
-    expect(restoreTarget(at(8))).toBe(3);
-    expect(restoreTarget(at(12))).toBe(7);
-    expect(restoreTarget(at(4))).toBeNull();
-    expect(restoreTarget({ ...at(8), payload: null })).toBeNull();
-    expect(restoreTarget({ ...at(8), payload: { ledger_seq: 8 } })).toBeNull();
+  it('reads lineage marks from restore events exactly as the engine does, and uses the engine’s abandonedWindows (DEC-036(5))', () => {
+    expect(lineageMark(at(8))).toEqual({ seq: 8, target: 3 });
+    expect(lineageMark(at(12))).toEqual({ seq: 12, target: 7 });
+    expect(lineageMark(at(4))).toBeNull();
+    expect(lineageMark({ ...at(8), payload: null })).toBeNull();
+
+    const marks = events.map(lineageMark).filter((mark): mark is LineageMark => mark !== null);
+    // c_3's lineage: resume(c_1) abandons (3, 8]. c_4's: resume(c_2) abandons (7, 12] and reinstates c_2's history.
+    expect(abandonedWindows(marks, c3.ledger_seq, c3.ledger_seq)).toEqual([[3, 8]]);
+    expect(abandonedWindows(marks, c4.ledger_seq, c4.ledger_seq)).toEqual([[7, 12]]);
+    // A mark whose target is not before it opens no window.
+    expect(abandonedWindows([...marks, { seq: 13, target: 13 }], 14, 14)).toEqual([[7, 12]]);
   });
 
   it('after resume(c_1), the next checkpoint hydrates none of the events the restore abandoned', async () => {
