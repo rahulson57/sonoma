@@ -19,6 +19,10 @@ const repoRoot = path.resolve(here, '..', '..', '..');
 const tsxCli = createRequire(import.meta.url).resolve('tsx/cli');
 const WITHIN_BUDGET = path.join(here, 'fixtures', 'within-budget.json');
 const OVER_BUDGET = path.join(here, 'fixtures', 'over-budget.json');
+/** within-budget.json with e-noop's scanRedact and gitCommit null (not measured); its p95 is still within budget. */
+const NOT_MEASURED = path.join(here, 'fixtures', 'not-measured.json');
+/** within-budget.json with every d-secret-output phase but scanRedact null; every budgeted scenario fully measured. */
+const NULL_BUDGET_UNMEASURED = path.join(here, 'fixtures', 'null-budget-unmeasured.json');
 const CLI_TIMEOUT_MS = 30_000;
 
 type Entry = BenchResult & Record<string, unknown>;
@@ -84,6 +88,32 @@ describe('check-budgets CLI', () => {
   );
 
   it(
+    'exits 1 for a budgeted scenario with a null phase, naming the scenario and the phase, although its p95 is within budget',
+    async () => {
+      const { code, stderr } = await runCli(['--results', NOT_MEASURED]);
+      expect(code).toBe(1);
+      expect(stderr).toContain('NOT MEASURED e-noop: scanRedact, gitCommit');
+      expect(stderr).not.toContain('PASS e-noop');
+      expect(stderr).toContain('bench:check FAILED: e-noop');
+    },
+    CLI_TIMEOUT_MS,
+  );
+
+  it(
+    'exits 0 when only the reported-only scenario has null phases',
+    async () => {
+      const { code, stdout } = await runCli(['--results', NULL_BUDGET_UNMEASURED]);
+      expect(code).toBe(0);
+      expect(stdout).toMatch(
+        /INFO d-secret-output .*\(reported, not budgeted\); not measured: changeDetection, hash, blobWrite, gitCommit, ledgerAppend, indexUpdate$/m,
+      );
+      expect(stdout).not.toContain('NOT MEASURED');
+      for (const [scenario] of BUDGETED) expect(stdout).toContain(`PASS ${scenario}`);
+    },
+    CLI_TIMEOUT_MS,
+  );
+
+  it(
     'exits 2 when the results file is missing or not JSON',
     async () => {
       expect((await runCli(['--results', path.join(tmp, 'does-not-exist.json')])).code).toBe(2);
@@ -121,6 +151,39 @@ describe('evaluate()', () => {
     expect(result.ok).toBe(false);
     expect(result.failed).toEqual([scenario]);
     expect(result.lines.some((l) => l.startsWith(`FAIL ${scenario} `) && l.includes('over budget'))).toBe(true);
+  });
+
+  it.each(BUDGETED)('fails %s as NOT MEASURED when any phase is null, whatever its p95Ms', (scenario) => {
+    const report = load();
+    const entry = entryOf(report, scenario);
+    entry.p95Ms = 0.1;
+    (entry.phases as Record<string, number | null>).ledgerAppend = null;
+    const result = evaluate(report);
+    expect(result.ok).toBe(false);
+    expect(result.failed).toEqual([scenario]);
+    expect(result.lines).toContain(`NOT MEASURED ${scenario}: ledgerAppend`);
+    expect(result.lines.some((l) => l.startsWith(`PASS ${scenario} `))).toBe(false);
+  });
+
+  it('reports both NOT MEASURED and over budget when both hold', () => {
+    const report = load();
+    const entry = entryOf(report, 'e-noop');
+    entry.p95Ms = 150;
+    (entry.phases as Record<string, number | null>).hash = null;
+    const result = evaluate(report);
+    expect(result.failed).toEqual(['e-noop']);
+    expect(result.lines).toContain('NOT MEASURED e-noop: hash');
+    expect(result.lines).toContainEqual(expect.stringMatching(/^FAIL e-noop .*p95 150\.0 ms is over budget 100\.0 ms/));
+  });
+
+  it('judges no phase dominant while any phase of the entry is not measured', () => {
+    const report = load();
+    (entryOf(report, 'b-many-files').phases as Record<string, number | null>).indexUpdate = null;
+    const lines = evaluate(report).lines;
+    const b = lines.indexOf(lines.find((l) => l.startsWith('FAIL b-many-files'))!);
+    expect(lines[b + 1]).toContain('changeDetection 238.6 ms |');
+    expect(lines[b + 1]).toContain('indexUpdate not measured');
+    expect(lines[b + 1]).not.toContain('(dominant)');
   });
 
   it('fails only when p95Ms > budgetMs: exactly at budget passes', () => {

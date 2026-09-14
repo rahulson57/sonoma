@@ -19,22 +19,28 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { percentile, phaseRecorder, type PhaseDurations } from '../../../bench/phases.js';
-import { BUDGETS, PHASES, readBenchResults, type ReadResults } from '../../../bench/results.schema.js';
+import { BUDGETS, PHASES, readBenchResults, unmeasuredPhases, type ReadResults } from '../../../bench/results.schema.js';
 
 const execFileAsync = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..', '..');
-const FIXTURES = ['within-budget.json', 'over-budget.json'].map((f) => path.join(here, 'fixtures', f));
+const FIXTURES = ['within-budget.json', 'over-budget.json', 'not-measured.json', 'null-budget-unmeasured.json'].map((f) =>
+  path.join(here, 'fixtures', f),
+);
 const LOCAL_RESULTS = path.join(repoRoot, 'bench', 'results.json');
 const SORTED_PHASES = [...PHASES].sort();
 
 const readJson = (file: string): unknown => JSON.parse(readFileSync(file, 'utf8'));
 
+/** Exactly the 7 keys; each a finite duration >= 0, or null = not measured (DEC-050). */
 function expectExactPhases({ results, errors }: ReadResults): void {
   expect(errors).toEqual([]);
   for (const { where, result } of results) {
     expect(Object.keys(result.phases).sort(), where).toEqual(SORTED_PHASES);
-    for (const phase of PHASES) expect(Number.isFinite(result.phases[phase]), `${where} ${phase}`).toBe(true);
+    for (const phase of PHASES) {
+      const value = result.phases[phase];
+      expect(value === null || (Number.isFinite(value) && value >= 0), `${where} ${phase}`).toBe(true);
+    }
   }
 }
 
@@ -86,6 +92,29 @@ describe('bench results format', () => {
     expect(errorsOf()).toMatch(/missing "phases"/);
   });
 
+  it('accepts null (not measured) for any phase, and nothing else in its place', () => {
+    const report = readJson(FIXTURES[0]!);
+    const entry = firstEntry(report);
+    const errorsOf = () => readBenchResults(report).errors.join('\n');
+
+    for (const phase of PHASES) entry.phases[phase] = null;
+    const read = readBenchResults(report);
+    expect(read.errors).toEqual([]);
+    expect(unmeasuredPhases(read.results[0]!.result)).toEqual([...PHASES]);
+
+    for (const bad of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -1, '0', false, {}]) {
+      entry.phases.hash = bad;
+      expect(errorsOf(), String(bad)).toMatch(/phases\.hash must be a finite number >= 0, or null when not measured/);
+    }
+  });
+
+  it('names the unmeasured phases of a result in SPEC-002 order', () => {
+    const read = readBenchResults(readJson(path.join(here, 'fixtures', 'not-measured.json')));
+    const noop = read.results.find((r) => r.result.scenario === 'e-noop')!;
+    expect(unmeasuredPhases(noop.result)).toEqual(['scanRedact', 'gitCommit']);
+    expect(read.results.filter((r) => r.result.scenario !== 'e-noop').every((r) => unmeasuredPhases(r.result).length === 0)).toBe(true);
+  });
+
   it('rejects malformed BenchResult fields and non-reports', () => {
     const report = readJson(FIXTURES[0]!);
     const entry = firstEntry(report);
@@ -121,6 +150,38 @@ describe('phaseRecorder', () => {
     expect(() => recorder.record(sample(-1, 1))).toThrow(/totalMs/);
     const { hash: _omitted, ...withoutHash } = sample(7, 1).phases;
     expect(() => recorder.record({ totalMs: 7, phases: withoutHash as PhaseDurations })).toThrow(/phases\.hash/);
+    // null is the only way to say "not measured": an undefined, NaN or negative value is still rejected.
+    for (const bad of [undefined, Number.NaN, -1]) {
+      expect(() => recorder.record({ totalMs: 7, phases: { ...sample(7, 1).phases, hash: bad as unknown as number } })).toThrow(/phases\.hash/);
+    }
+    expect(() => recorder.record({ totalMs: 7, phases: { ...sample(7, 1).phases, hash: null } })).not.toThrow();
+  });
+
+  it('reports a phase null when it was not measured, and never as 0', () => {
+    const recorder = phaseRecorder('e-noop');
+    const task: { result?: Record<string, unknown> } = {};
+    recorder.options.setup(task, 'run');
+    for (let i = 1; i <= 20; i++) recorder.record({ totalMs: i, phases: { ...sample(i, i / 10).phases, hash: null, blobWrite: null } });
+    recorder.options.teardown(task, 'run');
+
+    const phases = task.result?.phases as Record<string, number | null>;
+    expect(phases.hash).toBeNull();
+    expect(phases.blobWrite).toBeNull();
+    expect(phases.gitCommit).toBe(1.9);
+    expectExactPhases(readBenchResults([task.result]));
+  });
+
+  it('reports a phase null when ANY sample left it unmeasured, rather than a p95 of the rest', () => {
+    const recorder = phaseRecorder('b-many-files');
+    const task: { result?: Record<string, unknown> } = {};
+    recorder.options.setup(task, 'run');
+    for (let i = 1; i <= 19; i++) recorder.record(sample(i, i));
+    recorder.record({ totalMs: 20, phases: { ...sample(20, 20).phases, ledgerAppend: null } });
+    recorder.options.teardown(task, 'run');
+
+    const phases = task.result?.phases as Record<string, number | null>;
+    expect(phases.ledgerAppend).toBeNull();
+    expect(phases.indexUpdate).toBe(19);
   });
 
   it('attaches the BenchResult fields to the task result on the measured run only', () => {
@@ -162,7 +223,7 @@ describe('phaseRecorder', () => {
             "import { phaseRecorder, type PhaseDurations } from '../phases.js';",
             "import { PHASES } from '../results.schema.js';",
             "const recorder = phaseRecorder('e-noop');",
-            'const phases = Object.fromEntries(PHASES.map((p, i) => [p, i + 1])) as PhaseDurations;',
+            "const phases = Object.fromEntries(PHASES.map((p, i) => [p, p === 'hash' ? null : i + 1])) as PhaseDurations;",
             "describe('plumbing (constant numbers, not a measurement)', () => {",
             "  bench('checkpoint', () => { recorder.record({ totalMs: 12, phases }); }, { iterations: 5, time: 0, ...recorder.options });",
             '});',
@@ -182,6 +243,8 @@ describe('phaseRecorder', () => {
         expect(read.results).toHaveLength(1);
         expect(read.results[0]?.result).toMatchObject({ scenario: 'e-noop', budgetMs: 100, p95Ms: 12 });
         expect(read.results[0]?.result.phases.indexUpdate).toBe(7);
+        // A not-measured phase survives vitest's JSON report as null (not dropped, not 0).
+        expect(read.results[0]?.result.phases.hash).toBeNull();
       } finally {
         await rm(root, { recursive: true, force: true });
       }
