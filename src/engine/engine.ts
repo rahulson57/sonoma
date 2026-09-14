@@ -197,7 +197,9 @@ export class CheckpointEngine {
 
   /**
    * Append observations (from an adapter or SDK) in order. Each payload is sanitized first. Lineage and
-   * checkpoint event types are refused with ERR_RESERVED_EVENT.
+   * checkpoint event types are refused with ERR_RESERVED_EVENT. An observation's `intent_id` (SPEC-006 v3) is
+   * passed through UNCHANGED to the appended event, top-level and hashed, so an acknowledgement whose payload
+   * is offloaded to CAS still correlates with its request.
    */
   async record(observations: readonly LedgerEventDraft[]): Promise<LedgerEvent[]> {
     if (!Array.isArray(observations)) throw invalid('record needs an array of observations');
@@ -210,10 +212,15 @@ export class CheckpointEngine {
       if (ENGINE_OWNED_EVENT_TYPES.has(type)) {
         throw new EngineError('ERR_RESERVED_EVENT', `${type} is emitted by the engine or storage, not recorded as an observation`);
       }
+      const intentId: unknown = observation['intent_id'];
+      if (intentId !== undefined && intentId !== null && (typeof intentId !== 'string' || intentId === '')) {
+        throw invalid('observation.intent_id must be a non-empty string or null');
+      }
       const payload = sanitizePayload(type, observation['payload']);
       const event = await this.#serial(runId, async () => {
         const view = await this.#view(runId);
-        const appended = await this.#backend.appendEvent(runId, { type, actor, payload } as LedgerEventDraft);
+        const draft = { type, actor, payload, ...(intentId === undefined ? {} : { intent_id: intentId }) };
+        const appended = await this.#backend.appendEvent(runId, draft as LedgerEventDraft);
         this.#fold(view, appended);
         return appended;
       });

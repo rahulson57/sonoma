@@ -6,7 +6,7 @@ import { LEDGER_ACTORS, LEDGER_EVENT_TYPES } from '../../../src/ledger/event-typ
 import { chainHash } from '../../../src/ledger/hash.js';
 import { verifyChain } from '../../../src/ledger/verify-chain.js';
 import { SCHEMA_BASE_URI, SCHEMA_FILES, schemaDir, validateAgainst } from '../../../src/model/schemas.js';
-import { CLAIM_ORIGINS, INTENT_STATUSES, REVERSIBILITY, SEMANTIC_FIELDS, type LedgerEvent } from '../../../src/model/types.js';
+import { CLAIM_ORIGINS, INTENT_STATUSES, PROJECTION_SOURCES, REVERSIBILITY, SEMANTIC_FIELDS, type LedgerEvent } from '../../../src/model/types.js';
 import {
   validateAgentState,
   validateCheckpoint,
@@ -59,6 +59,8 @@ describe('schema/ files', () => {
     const claim = schemaFile(SCHEMA_FILES.semanticClaim) as unknown as Props;
     expect(claim.properties['field']?.enum).toEqual([...SEMANTIC_FIELDS]);
     expect(claim.properties['origin']?.enum).toEqual([...CLAIM_ORIGINS]);
+    const projection = schemaFile(SCHEMA_FILES.semanticProjection) as unknown as Props;
+    expect(projection.properties['source']?.enum).toEqual([...PROJECTION_SOURCES]);
     const sideEffect = schemaFile(SCHEMA_FILES.sideEffect) as unknown as Props;
     expect(sideEffect.properties['reversibility']?.enum).toEqual([...REVERSIBILITY]);
     const state = schemaFile(SCHEMA_FILES.agentState) as unknown as { $defs: { PendingIntent: Props } };
@@ -114,7 +116,7 @@ describe('ledger-event.schema.json', () => {
   });
 
   it('rejects an unknown event type', () => {
-    for (const type of ['state.declared', 'agent.suspended', 'tool.done', '']) {
+    for (const type of ['state.Declared', 'agent.paused', 'tool.done', '']) {
       const result = validateAgainst('ledgerEvent', { ...inline, type });
       expect(result.ok).toBe(false);
       expect(messages(result)).toContain('/type');

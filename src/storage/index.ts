@@ -1,5 +1,14 @@
 /** Local Storage (SPEC-005) public surface. */
-export type { CheckpointRef, NewCheckpoint, NewLedgerEvent, NewRun, StorageBackend, WorkspaceChanges } from './types.js';
+export type {
+  CheckpointRef,
+  NewCheckpoint,
+  NewLedgerEvent,
+  NewRun,
+  ProjectionQuery,
+  ReindexCounts,
+  StorageBackend,
+  WorkspaceChanges,
+} from './types.js';
 export { LocalBackend, type LocalBackendOptions, type StorageFaults } from './local-backend.js';
 export { StorageError, isStorageError, type StorageErrorCode } from './errors.js';
 export { BlobStore, assertBlobRef } from './cas.js';
@@ -17,7 +26,7 @@ export {
   type FileChangeStatus,
   type FileStatInfo,
 } from './change-detection.js';
-export { IndexDb, type IndexCounts } from './index-db.js';
+export { IndexDb, type IndexCounts, type IndexedProjection, type ProjectionIndexEntry } from './index-db.js';
 export { CHECKPOINT_IDENTITY, GitRepo, collectStagingTree, type CommitTreeOptions, type CommitTreeResult } from './git.js';
 export { ulid, CROCKFORD_BASE32, type RandomSource } from './ids.js';
 export {

@@ -1,9 +1,10 @@
 {
   "id": "proj_01J8Z3K5QW7XV2M9N4P6R8T0AC",
   "checkpointId": "c_2",
+  "source": "distilled",
   "distiller": {
     "provider": "anthropic",
-    "model": "claude-haiku-4-5-20251001",
+    "model": "claude-haiku-4-5",
     "promptVersion": "distill-v1"
   },
   "input": {

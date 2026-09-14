@@ -63,7 +63,8 @@ describe('semantic claim provenance (SPEC-004 / DEC-004)', () => {
     const projection = {
       id: 'proj_1',
       checkpointId: 'c_3',
-      distiller: { provider: 'anthropic', model: 'claude-haiku-4-5-20251001', promptVersion: 'distill-v1' },
+      source: 'distilled',
+      distiller: { provider: 'anthropic', model: 'claude-haiku-4-5', promptVersion: 'distill-v1' },
       input: { stateHash: 'a'.repeat(64), ledgerRange: [10, 42], workspaceCommit: 'b'.repeat(40) },
       claims: [claim({ origin: 'distilled' })],
       usage: { inputTokens: 1200, outputTokens: 180, costUsd: 0.0021 },

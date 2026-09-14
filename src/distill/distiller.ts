@@ -160,6 +160,7 @@ export async function distill(request: DistillRequest, deps: DistillDeps): Promi
   const projection: SemanticProjection = {
     id: (deps.newProjectionId ?? (() => `proj_${randomUUID()}`))(),
     checkpointId: request.checkpointId,
+    source: 'distilled',
     distiller: { provider: provider.name, model: provider.model, promptVersion: PROMPT_VERSION },
     input: { stateHash, ledgerRange: [from, to], workspaceCommit: request.workspaceCommit },
     claims,

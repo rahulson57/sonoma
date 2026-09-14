@@ -8,9 +8,12 @@ import type { AgentStateObject, BlobRef, SemanticProjection } from '../model/typ
 /** Recorded on every projection. Bump it whenever the prompt changes meaning. */
 export const PROMPT_VERSION = 'distill-v1';
 
-/** SPEC-007 default provider. The concrete provider is injected; these name the default. */
+/**
+ * SPEC-007 default provider. The concrete provider is injected; these name the default. The model id has
+ * no date suffix (SPEC-015 amendment 8, DEC-039).
+ */
 export const DEFAULT_PROVIDER = 'anthropic';
-export const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+export const DEFAULT_MODEL = 'claude-haiku-4-5';
 
 /** SPEC-007 `DistillBudget` default cap per run (config `distill.budgetUsd`). */
 export const DEFAULT_BUDGET_USD = 0.25;

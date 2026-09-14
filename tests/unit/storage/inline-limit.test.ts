@@ -47,6 +47,7 @@ describe('inline payload limit', () => {
         ts: '2026-01-01T00:00:00.000Z',
         type: 'tool.completed',
         actor: 'runtime',
+        intent_id: null,
         payload: { stdout: 'y'.repeat(MAX_INLINE_PAYLOAD_BYTES + 1) },
         payload_ref: null,
         prev_hash: GENESIS_PREV_HASH,

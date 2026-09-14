@@ -2,6 +2,9 @@
  * Execution Ledger append (SPEC-004): turns event drafts into sealed, hash-chained, immutable events.
  *
  * - `seq` is assigned here: contiguous and strictly increasing per run, starting at 1.
+ * - `intent_id` (SPEC-015 amendment 2) is copied from the draft to the top level of the sealed event, or null
+ *   when the draft has none, and is part of the hashed body. It stays on the event when the payload is
+ *   offloaded, so an acknowledgement still correlates with its request.
  * - `hash = sha256(prev_hash ‖ canonicalJSON(event without hash))`; seq 1 chains from GENESIS_PREV_HASH.
  * - A payload whose canonical JSON is over MAX_INLINE_PAYLOAD_BYTES (1 MiB, SPEC-002 payload limits)
  *   is written to the injected BlobSink as those canonical bytes. The event then carries
@@ -77,7 +80,7 @@ export interface ExecutionLedgerOptions {
   readonly head?: LedgerHead;
 }
 
-const DRAFT_KEYS: ReadonlySet<string> = new Set(['run_id', 'type', 'actor', 'payload']);
+const DRAFT_KEYS: ReadonlySet<string> = new Set(['run_id', 'type', 'actor', 'intent_id', 'payload']);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
@@ -144,8 +147,12 @@ export class ExecutionLedger {
     if (extra.length > 0) {
       throw new LedgerError(
         'ERR_INVALID_DRAFT',
-        `drafts carry only run_id, type, actor and payload; the ledger assigns the rest (got ${extra.join(', ')})`,
+        `drafts carry only run_id, type, actor, intent_id and payload; the ledger assigns the rest (got ${extra.join(', ')})`,
       );
+    }
+    const intentId: unknown = draft.intent_id ?? null;
+    if (intentId !== null && (typeof intentId !== 'string' || intentId === '')) {
+      throw new LedgerError('ERR_INVALID_DRAFT', `intent_id is a non-empty string or null, got ${JSON.stringify(intentId)}`);
     }
     const type: unknown = draft.type;
     const actor: unknown = draft.actor;
@@ -194,6 +201,7 @@ export class ExecutionLedger {
       ts: new Date(now).toISOString(),
       type,
       actor,
+      intent_id: intentId,
       payload,
       payload_ref,
       prev_hash: head.hash,

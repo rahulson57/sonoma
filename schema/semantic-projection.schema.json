@@ -2,22 +2,28 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ckpt.local/schema/semantic-projection.schema.json",
   "title": "SemanticProjection",
-  "description": "SPEC-007 versioned, derived projection for one checkpoint. Re-distilling creates a new projection id and never mutates an earlier one. Field names follow SPEC-007 verbatim.",
+  "description": "SPEC-007 versioned, derived projection for one checkpoint. Re-distilling creates a new projection id and never mutates an earlier one. Field names follow SPEC-007 verbatim. source (SPEC-015 amendment 3) is 'distilled' for Distiller output or 'declared' for an SDK/human declaration; distiller and usage may be null only for 'declared' (a cross-field rule enforced by validateSemanticProjection).",
   "type": "object",
-  "required": ["id", "checkpointId", "distiller", "input", "claims", "usage", "createdAt"],
+  "required": ["id", "checkpointId", "source", "distiller", "input", "claims", "usage", "createdAt"],
   "additionalProperties": false,
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "checkpointId": { "$ref": "common.schema.json#/$defs/CheckpointId" },
+    "source": { "enum": ["distilled", "declared"] },
     "distiller": {
-      "type": "object",
-      "required": ["provider", "model", "promptVersion"],
-      "additionalProperties": false,
-      "properties": {
-        "provider": { "type": "string", "minLength": 1 },
-        "model": { "type": "string", "minLength": 1 },
-        "promptVersion": { "type": "string", "minLength": 1 }
-      }
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["provider", "model", "promptVersion"],
+          "additionalProperties": false,
+          "properties": {
+            "provider": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 },
+            "promptVersion": { "type": "string", "minLength": 1 }
+          }
+        },
+        { "type": "null" }
+      ]
     },
     "input": {
       "type": "object",
@@ -37,14 +43,19 @@
     },
     "claims": { "type": "array", "items": { "$ref": "semantic-claim.schema.json" } },
     "usage": {
-      "type": "object",
-      "required": ["inputTokens", "outputTokens", "costUsd"],
-      "additionalProperties": false,
-      "properties": {
-        "inputTokens": { "type": "integer", "minimum": 0 },
-        "outputTokens": { "type": "integer", "minimum": 0 },
-        "costUsd": { "type": "number", "minimum": 0 }
-      }
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["inputTokens", "outputTokens", "costUsd"],
+          "additionalProperties": false,
+          "properties": {
+            "inputTokens": { "type": "integer", "minimum": 0 },
+            "outputTokens": { "type": "integer", "minimum": 0 },
+            "costUsd": { "type": "number", "minimum": 0 }
+          }
+        },
+        { "type": "null" }
+      ]
     },
     "createdAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
   }

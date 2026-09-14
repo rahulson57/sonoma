@@ -114,6 +114,10 @@ describe('replay(ref, {exact: true})', () => {
         getState: (ref) => b.getState(ref),
         fork: (ref) => b.fork(ref),
         reindex: () => b.reindex(),
+        listRuns: () => b.listRuns(),
+        putProjection: (p) => b.putProjection(p),
+        listProjections: (q) => b.listProjections(q),
+        listClaims: (q) => b.listClaims(q),
       };
       const engine = await CheckpointEngine.open({ backend: forging, repoDir: fx.repo.dir });
 
