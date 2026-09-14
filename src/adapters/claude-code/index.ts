@@ -35,5 +35,16 @@ export {
   createHookHandler,
   type HookHandler,
   type HookHandlerOptions,
+  type LockRetryPolicy,
 } from './handler.js';
-export { EXIT_COMMAND_NOT_FOUND, createRunner, type OpenedEngine, type Runner, type RunnerOptions, type SpawnProcess } from './run.js';
+export {
+  EXIT_COMMAND_NOT_FOUND,
+  FORWARDED_SIGNALS,
+  IGNORED_SIGNALS,
+  createRunner,
+  type OpenedEngine,
+  type Runner,
+  type RunnerOptions,
+  type SignalSource,
+  type SpawnProcess,
+} from './run.js';

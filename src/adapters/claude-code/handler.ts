@@ -4,8 +4,10 @@
  *
  * Never blocks the agent (SPEC-009): handleHook never rejects. A malformed payload, an unmapped hook, or any failure
  * while recording or checkpointing is appended as `adapter.error` / `adapter.unknown_hook` instead, and the `ckpt hook`
- * process exits 0 whatever this resolves to. It resolves to the id of the hook's primary event, or null when nothing
- * was appended:
+ * process exits 0 whatever this resolves to. It resolves to the id of the hook's primary event once that is appended
+ * (a later failure in the same invocation, e.g. its workspace.changed or its checkpoint, is recorded as adapter.error but
+ * does not change the result), to the adapter.error that replaced a primary event that could not be appended, or to
+ * null when nothing was appended:
  * - the invocation is not bound to a run (no CKPT_RUN_ID, DEC-044 / Q-026 default 3). This path is silent and touches
  *   nothing; `boundRunId()` lets the caller check it before opening a store at all;
  * - the store refused even the adapter.error. The observation is then LOST: without the run's writer lock nothing can
@@ -40,11 +42,20 @@ const SCAN_PAGE = 64;
 
 /**
  * ERR_RUN_LOCKED retry (DEC-044 / Q-026 default 7): a fixed, deterministic delay between attempts, and a total wait
- * of at most MAX_LOCK_WAIT_MS per write (≤ 5 s).
+ * of at most MAX_LOCK_WAIT_MS (≤ 5 s) per handleHook invocation. The budget is shared by every write, the boundary
+ * checkpoint and the adapter.error attempt of that invocation; once it is spent, each remaining step gets one attempt
+ * with no further wait.
  */
 export const MAX_LOCK_WAIT_MS = 2000;
 export const LOCK_RETRY_DELAY_MS = 50;
-export const DEFAULT_LOCK_RETRY = Object.freeze({ attempts: MAX_LOCK_WAIT_MS / LOCK_RETRY_DELAY_MS, delayMs: LOCK_RETRY_DELAY_MS });
+export const DEFAULT_LOCK_RETRY: LockRetryPolicy = Object.freeze({ maxWaitMs: MAX_LOCK_WAIT_MS, delayMs: LOCK_RETRY_DELAY_MS });
+
+export interface LockRetryPolicy {
+  /** Total sleep one handleHook invocation may spend waiting for the run lock. */
+  readonly maxWaitMs: number;
+  /** Sleep between attempts; must be positive. */
+  readonly delayMs: number;
+}
 
 export interface HookHandlerOptions {
   readonly engine: AdapterEngine;
@@ -52,7 +63,7 @@ export interface HookHandlerOptions {
   /** Where CKPT_RUN_ID is read from. Default `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly readWorkspaceStatus?: ReadWorkspaceStatus;
-  readonly lockRetry?: { readonly attempts: number; readonly delayMs: number };
+  readonly lockRetry?: LockRetryPolicy;
   readonly sleep?: (ms: number) => Promise<void>;
   /** Receives the one-line notice for a lost observation. Default: process.stderr. Never stdout. */
   readonly stderr?: (line: string) => void;
@@ -83,6 +94,12 @@ function errorKind(err: unknown): string {
   return err instanceof Error ? err.name : typeof err;
 }
 
+/** One handleHook invocation: the run it is bound to, and how much of its lock-wait budget it has slept. */
+interface Invocation {
+  readonly runId: string;
+  waitedMs: number;
+}
+
 async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
@@ -94,31 +111,38 @@ export function createHookHandler(options: HookHandlerOptions): HookHandler {
   const env = options.env ?? process.env;
   const readStatus = options.readWorkspaceStatus ?? gitWorkspaceStatus;
   const retry = options.lockRetry ?? DEFAULT_LOCK_RETRY;
+  if (!(Number.isFinite(retry.delayMs) && retry.delayMs > 0) || !(Number.isFinite(retry.maxWaitMs) && retry.maxWaitMs >= 0)) {
+    throw new TypeError('lockRetry needs a positive delayMs and a non-negative maxWaitMs');
+  }
   const sleep = options.sleep ?? defaultSleep;
   const stderr = options.stderr ?? defaultStderr;
 
-  /** Storage takes a run's writer lock per process and fails fast; another hook process may hold it briefly. */
-  async function withLockRetry<T>(fn: () => Promise<T>): Promise<T> {
-    for (let attempt = 1; ; attempt += 1) {
+  /**
+   * Storage takes a run's writer lock per process and fails fast; another hook process may hold it briefly. Every
+   * retry in one invocation draws on the same budget, so the invocation sleeps at most retry.maxWaitMs in total.
+   */
+  async function withLockRetry<T>(call: Invocation, fn: () => Promise<T>): Promise<T> {
+    for (;;) {
       try {
         return await fn();
       } catch (err) {
-        if (!isStorageError(err, 'ERR_RUN_LOCKED') || attempt >= retry.attempts) throw err;
+        if (!isStorageError(err, 'ERR_RUN_LOCKED') || call.waitedMs + retry.delayMs > retry.maxWaitMs) throw err;
+        call.waitedMs += retry.delayMs;
         await sleep(retry.delayMs);
       }
     }
   }
 
-  async function append(runId: string, observation: Observation): Promise<LedgerEvent> {
-    const [event] = await withLockRetry(() => engine.record([{ run_id: runId, ...observation }]));
+  async function append(call: Invocation, observation: Observation): Promise<LedgerEvent> {
+    const [event] = await withLockRetry(call, () => engine.record([{ run_id: call.runId, ...observation }]));
     if (event === undefined) throw new Error('record() appended nothing');
     return event;
   }
 
   /** Append adapter.error. When even that fails, the observation is lost: say so on stderr and resolve null. */
-  async function appendError(runId: string, hook: string | null, stage: string, err: unknown): Promise<EventId | null> {
+  async function appendError(call: Invocation, hook: string | null, stage: string, err: unknown): Promise<EventId | null> {
     try {
-      return (await append(runId, adapterError(hook, stage, err))).event_id;
+      return (await append(call, adapterError(hook, stage, err))).event_id;
     } catch (appendErr) {
       try {
         stderr(`ckpt hook ${hook ?? '(unparsed)'}: observation not recorded (${errorKind(appendErr)})\n`);
@@ -163,69 +187,75 @@ export function createHookHandler(options: HookHandlerOptions): HookHandler {
     return null;
   }
 
-  async function sessionStart(runId: string, hook: Extract<ParsedHook, { kind: 'SessionStart' }>): Promise<EventId> {
+  async function sessionStart(call: Invocation, hook: Extract<ParsedHook, { kind: 'SessionStart' }>): Promise<EventId> {
     // Decided from the run's ledger (DEC-044(1)): the first SessionStart of a run started by run() finds nothing after
     // the run.created that startRun() emitted, and resolves to it.
-    const head = await ledger.getEvents(runId, { fromSeq: 1, toSeq: 2 });
+    const head = await ledger.getEvents(call.runId, { fromSeq: 1, toSeq: 2 });
     const first = head[0];
     if (head.length === 1 && first !== undefined && first.type === 'run.created') return first.event_id;
-    return (await append(runId, sessionStarted(hook))).event_id;
+    return (await append(call, sessionStarted(hook))).event_id;
   }
 
-  async function preToolUse(runId: string, hook: Extract<ParsedHook, { kind: 'PreToolUse' }>): Promise<EventId> {
+  async function preToolUse(call: Invocation, hook: Extract<ParsedHook, { kind: 'PreToolUse' }>): Promise<EventId> {
     // The before-status must be read before the tool runs, so it precedes the append that carries it.
-    const observed = WORKSPACE_TOOLS.has(hook.tool) ? await statusOf(runId) : { status: null, error: undefined };
-    const event = await append(runId, toolRequested(hook, observed.status?.digest ?? null));
-    if (observed.error !== undefined) await appendError(runId, hook.kind, 'workspace_status', observed.error);
+    const observed = WORKSPACE_TOOLS.has(hook.tool) ? await statusOf(call.runId) : { status: null, error: undefined };
+    const event = await append(call, toolRequested(hook, observed.status?.digest ?? null));
+    if (observed.error !== undefined) await appendError(call, hook.kind, 'workspace_status', observed.error);
     return event.event_id;
   }
 
-  async function postToolUse(runId: string, hook: Extract<ParsedHook, { kind: 'PostToolUse' }>): Promise<EventId> {
-    if (isErrorResponse(hook.response)) return (await append(runId, toolFailedResponse(hook))).event_id;
-    if (!WORKSPACE_TOOLS.has(hook.tool)) return (await append(runId, toolCompleted(hook))).event_id;
+  async function postToolUse(call: Invocation, hook: Extract<ParsedHook, { kind: 'PostToolUse' }>): Promise<EventId> {
+    if (isErrorResponse(hook.response)) return (await append(call, toolFailedResponse(hook))).event_id;
+    if (!WORKSPACE_TOOLS.has(hook.tool)) return (await append(call, toolCompleted(hook))).event_id;
 
-    // The tool has already run: its after-status is read while tool.completed is appended (statusOf never rejects).
-    const [completed, observed] = await Promise.all([append(runId, toolCompleted(hook)), statusOf(runId)]);
+    // The tool has already run. Both steps start together (statusOf never rejects), but statusOf first awaits
+    // engine.workspaceDir(), which the engine serializes behind record(): in practice git status runs after the append.
+    const [completed, observed] = await Promise.all([append(call, toolCompleted(hook)), statusOf(call.runId)]);
     if (observed.status === null) {
-      await appendError(runId, hook.kind, 'workspace_status', observed.error);
+      await appendError(call, hook.kind, 'workspace_status', observed.error);
       return completed.event_id;
     }
-    // Only a change known against the PreToolUse status is reported; the next checkpoint captures the workspace anyway.
-    const before = await requestedStatus(runId, hook.toolUseId, completed.seq);
-    if (before !== null && before !== observed.status.digest) {
-      await append(runId, workspaceChanged(hook, before, observed.status));
+    try {
+      // Only a change known against the PreToolUse status is reported; the next checkpoint captures the workspace anyway.
+      const before = await requestedStatus(call.runId, hook.toolUseId, completed.seq);
+      if (before !== null && before !== observed.status.digest) {
+        await append(call, workspaceChanged(hook, before, observed.status));
+      }
+    } catch (err) {
+      // tool.completed is already in the ledger: it stays the result, and the missed workspace.changed is recorded.
+      await appendError(call, hook.kind, 'record', err);
     }
     return completed.event_id;
   }
 
-  async function boundary(runId: string, hook: Extract<ParsedHook, { kind: 'Stop' | 'SessionEnd' }>): Promise<EventId> {
-    const suspended = await append(runId, agentSuspended(hook));
+  async function boundary(call: Invocation, hook: Extract<ParsedHook, { kind: 'Stop' | 'SessionEnd' }>): Promise<EventId> {
+    const suspended = await append(call, agentSuspended(hook));
     try {
       // Automatic checkpoint: no label, so no distillation request (SPEC-002: automatic checkpoints never call an LLM).
-      await withLockRetry(() => engine.checkpoint(runId));
+      await withLockRetry(call, () => engine.checkpoint(call.runId));
     } catch (err) {
-      await appendError(runId, hook.kind, 'checkpoint', err);
+      await appendError(call, hook.kind, 'checkpoint', err);
     }
     return suspended.event_id;
   }
 
-  async function dispatch(runId: string, hook: ParsedHook): Promise<EventId> {
+  async function dispatch(call: Invocation, hook: ParsedHook): Promise<EventId> {
     switch (hook.kind) {
       case 'unknown':
-        return (await append(runId, unknownHook(hook))).event_id;
+        return (await append(call, unknownHook(hook))).event_id;
       case 'SessionStart':
-        return sessionStart(runId, hook);
+        return sessionStart(call, hook);
       case 'UserPromptSubmit':
-        return (await append(runId, promptSubmitted(hook))).event_id;
+        return (await append(call, promptSubmitted(hook))).event_id;
       case 'PreToolUse':
-        return preToolUse(runId, hook);
+        return preToolUse(call, hook);
       case 'PostToolUse':
-        return postToolUse(runId, hook);
+        return postToolUse(call, hook);
       case 'PostToolUseFailure':
-        return (await append(runId, toolFailed(hook))).event_id;
+        return (await append(call, toolFailed(hook))).event_id;
       case 'Stop':
       case 'SessionEnd':
-        return boundary(runId, hook);
+        return boundary(call, hook);
     }
   }
 
@@ -233,17 +263,18 @@ export function createHookHandler(options: HookHandlerOptions): HookHandler {
     async handleHook(payload: unknown): Promise<EventId | null> {
       const runId = boundRunId(env);
       if (runId === null) return null;
+      const call: Invocation = { runId, waitedMs: 0 };
 
       let hook: ParsedHook;
       try {
         hook = parseHookPayload(payload);
       } catch (err) {
-        return appendError(runId, null, 'parse', err);
+        return appendError(call, null, 'parse', err);
       }
       try {
-        return await dispatch(runId, hook);
+        return await dispatch(call, hook);
       } catch (err) {
-        return appendError(runId, hook.kind === 'unknown' ? hook.hookEventName : hook.kind, 'record', err);
+        return appendError(call, hook.kind === 'unknown' ? hook.hookEventName : hook.kind, 'record', err);
       }
     },
   };

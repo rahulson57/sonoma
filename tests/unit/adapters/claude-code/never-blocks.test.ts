@@ -2,8 +2,9 @@
  * SPEC-009 criterion: a malformed or unknown hook payload makes handleHook exit 0 and append adapter.error or
  * adapter.unknown_hook. More generally, handleHook never rejects: a failure while recording, reading git status or
  * checkpointing is recorded as adapter.error, and the `ckpt hook` process exits 0 on whatever it resolves to.
- * DEC-044: an unbound invocation writes and prints nothing; a lock that never frees costs at most MAX_LOCK_WAIT_MS
- * (≤ 5 s), and the lost observation is reported as one stderr line that carries no payload data.
+ * DEC-044: an unbound invocation writes and prints nothing; a lock that never frees costs one handleHook invocation at
+ * most MAX_LOCK_WAIT_MS (≤ 5 s) of waiting in total, however many writes, checkpoints and adapter.error attempts it
+ * makes; and a lost observation is reported as one stderr line that carries no payload data.
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -85,10 +86,32 @@ describe('handleHook never blocks the agent', () => {
   });
 
   describe('run lock held by another hook process (ERR_RUN_LOCKED)', () => {
-    it('the default retry waits a fixed delay, capped by an exported constant of at most 5 s', () => {
+    const locked = () => new StorageError('ERR_RUN_LOCKED', 'held by another hook process');
+
+    /** A sleep that only adds up what it was asked to wait. */
+    function countingSleep() {
+      const counter = {
+        waited: 0,
+        sleep: async (ms: number) => {
+          counter.waited += ms;
+        },
+      };
+      return counter;
+    }
+
+    it('the default retry waits a fixed delay, the whole invocation capped by an exported constant of at most 5 s', () => {
       expect(MAX_LOCK_WAIT_MS).toBeLessThanOrEqual(5000);
-      expect(DEFAULT_LOCK_RETRY.delayMs).toBe(LOCK_RETRY_DELAY_MS);
-      expect((DEFAULT_LOCK_RETRY.attempts - 1) * DEFAULT_LOCK_RETRY.delayMs).toBeLessThanOrEqual(MAX_LOCK_WAIT_MS);
+      expect(LOCK_RETRY_DELAY_MS).toBeGreaterThan(0);
+      expect(DEFAULT_LOCK_RETRY).toEqual({ maxWaitMs: MAX_LOCK_WAIT_MS, delayMs: LOCK_RETRY_DELAY_MS });
+    });
+
+    it.each([
+      ['a zero delay', { maxWaitMs: 100, delayMs: 0 }],
+      ['a negative budget', { maxWaitMs: -1, delayMs: 50 }],
+      ['a non-finite budget', { maxWaitMs: Number.POSITIVE_INFINITY, delayMs: 50 }],
+    ])('refuses a retry policy with %s', (_label, lockRetry) => {
+      const engine = new FakeEngine();
+      expect(() => createHookHandler({ engine, ledger: engine, env: { [RUN_ID_ENV]: RUN_ID }, lockRetry })).toThrow(TypeError);
     });
 
     it('retries with the fixed delay while the lock is held, then records', async () => {
@@ -102,24 +125,87 @@ describe('handleHook never blocks the agent', () => {
       expect(sleep.mock.calls).toEqual([[LOCK_RETRY_DELAY_MS], [LOCK_RETRY_DELAY_MS]]);
     });
 
-    it('with the default policy, a lock that never frees waits at most MAX_LOCK_WAIT_MS per write', async () => {
+    it('with the default policy, a lock that never frees costs one invocation at most MAX_LOCK_WAIT_MS in total', async () => {
       const engine = new FakeEngine();
-      engine.failRecord = () => new StorageError('ERR_RUN_LOCKED', 'held');
-      let waited = 0;
+      engine.failRecord = () => locked();
+      const clock = countingSleep();
+      const stderr: string[] = [];
+      const handler = createHookHandler({ engine, ledger: engine, env: { [RUN_ID_ENV]: RUN_ID }, sleep: clock.sleep, stderr: (line) => stderr.push(line) });
+      await expect(handler.handleHook(fixture(FIXTURES.UserPromptSubmit))).resolves.toBeNull();
+      // The hook's own event and the adapter.error attempt share one budget.
+      expect(clock.waited).toBeLessThanOrEqual(MAX_LOCK_WAIT_MS);
+      expect(clock.waited).toBeGreaterThan(MAX_LOCK_WAIT_MS - LOCK_RETRY_DELAY_MS);
+      expect(engine.drafts.map((draft) => draft.type).filter((type) => type === 'adapter.error')).toHaveLength(1);
+      expect(stderr).toHaveLength(1);
+    });
+
+    it('worst case PostToolUse(Write): tool.completed takes the whole budget; workspace.changed and adapter.error get one attempt each and no more wait', async () => {
+      const engine = new FakeEngine();
+      const clock = countingSleep();
       const stderr: string[] = [];
       const handler = createHookHandler({
         engine,
         ledger: engine,
         env: { [RUN_ID_ENV]: RUN_ID },
-        sleep: async (ms) => {
-          waited += ms;
-        },
+        readWorkspaceStatus: scriptedStatus(['', '?? scripts/deploy.ts\0']),
+        sleep: clock.sleep,
         stderr: (line) => stderr.push(line),
       });
+      await handler.handleHook(fixture(FIXTURES.PreToolUse));
+      expect(clock.waited).toBe(0);
+
+      // tool.completed gets the lock on the last attempt the budget allows; nothing after it ever does.
+      engine.failRecord = (draft) => (draft.type !== 'tool.completed' || clock.waited < MAX_LOCK_WAIT_MS ? locked() : undefined);
+      const id = await handler.handleHook(fixture(FIXTURES.PostToolUse));
+
+      expect(clock.waited).toBeLessThanOrEqual(MAX_LOCK_WAIT_MS);
+      expect(engine.types).toEqual(['run.created', 'tool.requested', 'tool.completed']);
+      const attempts = engine.drafts.slice(1).map((draft) => draft.type);
+      expect(attempts.filter((type) => type === 'workspace.changed')).toHaveLength(1);
+      expect(attempts.filter((type) => type === 'adapter.error')).toHaveLength(1);
+      // tool.completed WAS appended, so it stays the result.
+      expect(id).toBe(engine.events.at(-1)!.event_id);
+      expect(stderr).toEqual(['ckpt hook PostToolUse: observation not recorded (ERR_RUN_LOCKED)\n']);
+    });
+
+    it('worst case Stop: agent.suspended takes the whole budget; the checkpoint and adapter.error get one attempt each and no more wait', async () => {
+      const engine = new FakeEngine();
+      const clock = countingSleep();
+      const stderr: string[] = [];
+      const handler = createHookHandler({ engine, ledger: engine, env: { [RUN_ID_ENV]: RUN_ID }, sleep: clock.sleep, stderr: (line) => stderr.push(line) });
+      engine.failRecord = (draft) => (draft.type !== 'agent.suspended' || clock.waited < MAX_LOCK_WAIT_MS ? locked() : undefined);
+      let checkpointAttempts = 0;
+      engine.failCheckpoint = () => {
+        checkpointAttempts += 1;
+        return locked();
+      };
+
+      const id = await handler.handleHook(fixture(FIXTURES.Stop));
+
+      expect(clock.waited).toBeLessThanOrEqual(MAX_LOCK_WAIT_MS);
+      expect(engine.types).toEqual(['run.created', 'agent.suspended']);
+      expect(engine.checkpoints).toEqual([]);
+      expect(checkpointAttempts).toBe(1);
+      expect(engine.drafts.map((draft) => draft.type).filter((type) => type === 'adapter.error')).toHaveLength(1);
+      expect(id).toBe(engine.events.at(-1)!.event_id);
+      expect(stderr).toEqual(['ckpt hook Stop: observation not recorded (ERR_RUN_LOCKED)\n']);
+    });
+
+    it('the budget belongs to one invocation: the next hook waits for the lock again', async () => {
+      const engine = new FakeEngine();
+      const clock = countingSleep();
+      const handler = createHookHandler({ engine, ledger: engine, env: { [RUN_ID_ENV]: RUN_ID }, sleep: clock.sleep, stderr: () => undefined });
+      engine.failRecord = () => locked();
       await expect(handler.handleHook(fixture(FIXTURES.UserPromptSubmit))).resolves.toBeNull();
-      // The hook's own event, then the adapter.error attempt: two writes, each capped.
-      expect(waited).toBeLessThanOrEqual(2 * MAX_LOCK_WAIT_MS);
-      expect(stderr).toHaveLength(1);
+      const spent = clock.waited;
+      expect(spent).toBeGreaterThan(MAX_LOCK_WAIT_MS - LOCK_RETRY_DELAY_MS);
+
+      let refusals = 0;
+      engine.failRecord = () => (refusals++ < 2 ? locked() : undefined);
+      const id = await handler.handleHook(fixture(FIXTURES.UserPromptSubmit));
+      expect(engine.types).toEqual(['run.created', 'model.requested']);
+      expect(id).toBe(engine.events.at(-1)!.event_id);
+      expect(clock.waited - spent).toBe(2 * LOCK_RETRY_DELAY_MS);
     });
 
     it('when even adapter.error cannot be appended: resolves null, one stderr line with no payload data, nothing appended', async () => {
@@ -130,7 +216,7 @@ describe('handleHook never blocks the agent', () => {
         engine,
         ledger: engine,
         env: { [RUN_ID_ENV]: RUN_ID },
-        lockRetry: { attempts: 3, delayMs: 0 },
+        lockRetry: { maxWaitMs: 100, delayMs: 50 },
         sleep: async () => undefined,
         stderr: (line) => stderr.push(line),
       });
