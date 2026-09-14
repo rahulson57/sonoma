@@ -2,6 +2,7 @@
 export { CheckpointEngine, ENGINE_OWNED_EVENT_TYPES, type CheckpointEngineOptions } from './engine.js';
 export { EngineError, isEngineError, type EngineErrorCode } from './errors.js';
 export { assertCheckpointRef, formatCheckpointRef, parseCheckpointRef, toStorageRef } from './refs.js';
+export { LINEAGE_SCHEMAS, lineagePayload, type LineageEventType, type LineageFieldKind } from './lineage.js';
 export { MAX_TOOL_OUTPUT_BYTES, sanitizePayload } from './observations.js';
 export { NO_RESPONSE_HASH, deriveSideEffects } from './side-effects.js';
 export { diffJson } from './json-patch.js';

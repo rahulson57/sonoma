@@ -20,25 +20,28 @@
  * - cumulative token usage from `model.responded`.
  * So a fresh process (after `kill -9`) reaches the same view from the durable ledger.
  *
- * Engine-authored lineage events (`run.created`, `agent.resumed`, `agent.forked`, `agent.rolled_back`) carry
- * only ckpt-generated identifiers (run and checkpoint ids, commit ids, seqs), which are checked against
- * their patterns before append. They are not captured data, so they are not routed through `sanitize()`
- * (whose high-entropy detector would redact commit ids).
+ * Engine-authored lineage events (`agent.resumed`, `agent.forked`, `agent.rolled_back`) carry only
+ * ckpt-generated identifiers (run and checkpoint ids, commit ids, seqs). Each payload is validated against its
+ * exact per-event-type schema (lineage.ts, DEC-024) BEFORE the worktree, a forked run or the ledger is
+ * written, and is not routed through `sanitize()` (whose high-entropy detector would redact commit ids).
+ * Caller-supplied strings are never exempt: `run.created`'s agent name (also stored in the run record) and
+ * checkpoint labels are sanitized.
  */
 import { stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { derivePendingIntent } from '../ledger/pending-intent.js';
 import { verifyChain } from '../ledger/verify-chain.js';
-import type { Checkpoint, JsonPayload, LedgerEvent, LedgerEventDraft, Run, SideEffect } from '../model/types.js';
+import type { Checkpoint, LedgerEvent, LedgerEventDraft, Run, SideEffect } from '../model/types.js';
 import { sanitize } from '../redact/index.js';
-import { CHECKPOINT_ID_PATTERN, RUN_ID_PATTERN, STORE_DIR_NAME } from '../storage/layout.js';
+import { STORE_DIR_NAME } from '../storage/layout.js';
 import type { StorageBackend } from '../storage/types.js';
 import { EngineError } from './errors.js';
 import { WorkspaceGit } from './git.js';
 import { diffJson } from './json-patch.js';
+import { lineagePayload } from './lineage.js';
 import { sanitizePayload } from './observations.js';
-import { COMMIT_PATTERN, assertRunId, toStorageRef } from './refs.js';
+import { assertRunId, toStorageRef } from './refs.js';
 import { deriveSideEffects } from './side-effects.js';
 import { MAX_SNAPSHOT_FILE_BYTES, buildSnapshot, type SnapshotCache } from './snapshot.js';
 import type {
@@ -112,18 +115,6 @@ function tokenCount(value: unknown): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
-/** A lineage payload: ckpt-generated identifiers only, each checked against its pattern. */
-function lineagePayload(fields: Record<string, string | number>): JsonPayload {
-  for (const [key, value] of Object.entries(fields)) {
-    const ok =
-      typeof value === 'number'
-        ? Number.isSafeInteger(value) && value >= 0
-        : RUN_ID_PATTERN.test(value) || CHECKPOINT_ID_PATTERN.test(value) || COMMIT_PATTERN.test(value);
-    if (!ok) throw new EngineError('ERR_CORRUPT', `lineage field ${key} holds ${JSON.stringify(value)}, not a ckpt identifier`);
-  }
-  return fields;
-}
-
 export class CheckpointEngine {
   readonly #backend: StorageBackend;
   readonly #git: WorkspaceGit;
@@ -176,18 +167,24 @@ export class CheckpointEngine {
 
   // ── ingestion ───────────────────────────────────────────────────────────────────────────────────
 
-  /** Create a run whose workspace is the user's worktree (read-only) until it is resumed or rolled back. */
+  /**
+   * Create a run whose workspace is the user's worktree (read-only) until it is resumed or rolled back.
+   * `agent` is caller-supplied free text, so it is sanitized before anything is persisted: the run record,
+   * the index, every forked run that copies it and `run.created` only ever hold the redacted name
+   * (SPEC-003, DEC-024(b)).
+   */
   async startRun(input: { readonly agent: string }): Promise<Run> {
     if (!isRecord(input) || typeof input.agent !== 'string' || input.agent.trim() === '') {
       throw invalid('startRun needs a non-empty agent');
     }
-    const run = await this.#backend.createRun({ agent: input.agent });
+    const agent = sanitize(input.agent).output;
+    const run = await this.#backend.createRun({ agent });
     return this.#serial(run.run_id, async () => {
       const view = await this.#view(run.run_id);
       const event = await this.#backend.appendEvent(run.run_id, {
         type: 'run.created',
         actor: 'runtime',
-        payload: sanitizePayload('run.created', { agent: input.agent, workspace: 'repo' }),
+        payload: sanitizePayload('run.created', { agent, workspace: 'repo' }),
       });
       this.#fold(view, event);
       return run;
@@ -310,20 +307,18 @@ export class CheckpointEngine {
     return this.#serial(at.run_id, async () => {
       const checkpoint = await this.#backend.getCheckpoint(at);
       const state = await this.#backend.getState(at);
+      // Validated before the worktree or the ledger is written (DEC-024(a)).
+      const payload = lineagePayload(
+        'agent.resumed',
+        { checkpoint_id: checkpoint.checkpoint_id, ledger_seq: checkpoint.ledger_seq, workspace_commit: checkpoint.workspace_commit },
+        this.#git.objectFormat,
+      );
       const worktreePath = this.worktreePath(at.run_id);
       await this.#git.materialize(worktreePath, checkpoint.workspace_commit);
 
       const view = await this.#view(at.run_id);
       const pendingIntent = derivePendingIntent(view.intentEvents);
-      const event = await this.#backend.appendEvent(at.run_id, {
-        type: 'agent.resumed',
-        actor: 'runtime',
-        payload: lineagePayload({
-          checkpoint_id: checkpoint.checkpoint_id,
-          ledger_seq: checkpoint.ledger_seq,
-          workspace_commit: checkpoint.workspace_commit,
-        }),
-      });
+      const event = await this.#backend.appendEvent(at.run_id, { type: 'agent.resumed', actor: 'runtime', payload });
       this.#fold(view, event);
       return { checkpoint, state, worktreePath, pendingIntent };
     });
@@ -337,20 +332,22 @@ export class CheckpointEngine {
   async fork(ref: CheckpointRef): Promise<Run> {
     const at = toStorageRef(ref);
     const source = await this.#backend.getCheckpoint(at);
+    // Validated before the forked run, its worktree or its ledger is written (DEC-024(a)).
+    const payload = lineagePayload(
+      'agent.forked',
+      {
+        parent_run_id: source.run_id,
+        forked_from_checkpoint: source.checkpoint_id,
+        ledger_seq: source.ledger_seq,
+        workspace_commit: source.workspace_commit,
+      },
+      this.#git.objectFormat,
+    );
     const run = await this.#backend.fork(at);
     return this.#serial(run.run_id, async () => {
       await this.#git.materialize(this.worktreePath(run.run_id), source.workspace_commit);
       const view = await this.#view(run.run_id);
-      const event = await this.#backend.appendEvent(run.run_id, {
-        type: 'agent.forked',
-        actor: 'runtime',
-        payload: lineagePayload({
-          parent_run_id: source.run_id,
-          forked_from_checkpoint: source.checkpoint_id,
-          ledger_seq: source.ledger_seq,
-          workspace_commit: source.workspace_commit,
-        }),
-      });
+      const event = await this.#backend.appendEvent(run.run_id, { type: 'agent.forked', actor: 'runtime', payload });
       this.#fold(view, event);
       return run;
     });
@@ -366,17 +363,19 @@ export class CheckpointEngine {
       const restored = await this.#backend.getCheckpoint(at);
       const view = await this.#view(at.run_id);
       const warnings = deriveSideEffects(view.intentEvents, restored.ledger_seq, view.seq);
-      await this.#git.materialize(this.worktreePath(at.run_id), restored.workspace_commit);
-      const event = await this.#backend.appendEvent(at.run_id, {
-        type: 'agent.rolled_back',
-        actor: 'runtime',
-        payload: lineagePayload({
+      // Validated before the worktree or the ledger is written (DEC-024(a)).
+      const payload = lineagePayload(
+        'agent.rolled_back',
+        {
           checkpoint_id: restored.checkpoint_id,
           ledger_seq: restored.ledger_seq,
           workspace_commit: restored.workspace_commit,
           side_effect_warnings: warnings.length,
-        }),
-      });
+        },
+        this.#git.objectFormat,
+      );
+      await this.#git.materialize(this.worktreePath(at.run_id), restored.workspace_commit);
+      const event = await this.#backend.appendEvent(at.run_id, { type: 'agent.rolled_back', actor: 'runtime', payload });
       this.#fold(view, event);
       return { restored, warnings };
     });

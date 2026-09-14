@@ -6,8 +6,11 @@
  * - tree reads and diffs are commit-to-commit and touch no index;
  * - a workspace is only ever written inside an execution worktree, a detached `git worktree` with its own
  *   index under `<git common dir>/worktrees/<name>`. Before a forced checkout the directory is verified
- *   to be the top level of its own worktree, so a misconfigured path can never force-checkout the
- *   user's worktree.
+ *   to be the top level of its own worktree OF THIS REPOSITORY, so a misconfigured path can never
+ *   force-checkout or clean the user's worktree or another repository;
+ * - the engine never runs `git worktree prune` and never touches another worktree's registration: the
+ *   user's linked worktrees, including ones whose directory is temporarily missing, keep their admin
+ *   directories and indexes.
  *
  * Every invocation strips inherited GIT_* variables, disables hooks, system config and optional locks,
  * and never talks to a remote.
@@ -126,8 +129,8 @@ export class WorkspaceGit {
   /**
    * Make `dir` a detached execution worktree whose HEAD, index and files are exactly `commit`.
    * An existing execution worktree is force-checked-out and cleaned of every untracked file except the
-   * PRESERVED_ON_RESTORE secret paths. A `dir` that exists but is not the top level of its own worktree is
-   * refused (ERR_WORKSPACE), and nothing is written.
+   * PRESERVED_ON_RESTORE secret paths. A `dir` that exists but is not the top level of its own worktree of this
+   * repository (same common git directory) is refused (ERR_WORKSPACE), and nothing is written.
    */
   async materialize(dir: string, commit: string): Promise<void> {
     let exists = true;
@@ -139,11 +142,16 @@ export class WorkspaceGit {
     }
 
     if (exists) {
-      const top = await runGit(['rev-parse', '--show-toplevel'], dir);
-      const topPath = top.stdout.toString('utf8').trim();
-      const own = top.code === 0 && topPath !== '' && (await realpath(topPath)) === (await realpath(dir));
+      const info = await runGit(['rev-parse', '--show-toplevel', '--git-common-dir'], dir);
+      const [topPath = '', commonPath = ''] = info.stdout.toString('utf8').split('\n');
+      const own =
+        info.code === 0 &&
+        topPath !== '' &&
+        commonPath !== '' &&
+        (await realpath(topPath)) === (await realpath(dir)) &&
+        (await realpath(path.resolve(dir, commonPath))) === (await realpath(this.commonDir));
       if (!own || (await realpath(dir)) === (await realpath(this.workTree))) {
-        throw new EngineError('ERR_WORKSPACE', `${dir} exists and is not a ckpt execution worktree; refusing to overwrite it`);
+        throw new EngineError('ERR_WORKSPACE', `${dir} exists and is not a ckpt execution worktree of this repository; refusing to overwrite it`);
       }
       await gitOk(['checkout', '--quiet', '--detach', '--force', commit], dir);
       await gitOk(['clean', '-ffdxq', ...PRESERVED_ON_RESTORE.flatMap((pattern) => ['-e', pattern])], dir);
@@ -151,8 +159,9 @@ export class WorkspaceGit {
     }
 
     await mkdir(path.dirname(dir), { recursive: true, mode: 0o700 });
-    // Drop registrations of worktrees whose directories are gone, so the name can be reused.
-    await gitOk(['worktree', 'prune'], this.workTree);
+    // No `git worktree prune`: it is repository-wide and would delete the admin directory (and index) of any
+    // user linked worktree whose directory is temporarily missing. `add --force` takes over a stale
+    // registration of this same path by itself, so only ckpt's own registration is ever affected.
     await gitOk(['worktree', 'add', '--detach', '--force', dir, commit], this.workTree);
   }
 }
