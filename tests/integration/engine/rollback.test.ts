@@ -93,4 +93,38 @@ describe('rollback()', () => {
       await fx.cleanup();
     }
   });
+
+  it('DEC-031: checkpoint() after rollback(c_1) does not record call_edit as completed but still records se_email as completed', async () => {
+    const fx = await engineFixture({ files: { 'app.txt': 'v0\n' } });
+    try {
+      const id = (await fx.engine.startRun({ agent: 'claude-code' })).run_id;
+      const tool = (type: 'tool.requested' | 'tool.completed', callId: string): LedgerEventDraft =>
+        ({ run_id: id, type, actor: type === 'tool.requested' ? 'agent' : 'runtime', payload: { tool_call_id: callId } }) as LedgerEventDraft;
+
+      await fx.engine.record([tool('tool.requested', 'call_read'), tool('tool.completed', 'call_read')]);
+      const c1 = await fx.engine.checkpoint(id);
+      await writeFiles(fx.repo.dir, { 'app.txt': 'v2\n' });
+      await fx.engine.record([
+        tool('tool.requested', 'call_edit'),
+        tool('tool.completed', 'call_edit'),
+        ...sideEffect(id, 'se_email', { type: 'email.send', target: 'ops@example.invalid', reversibility: 'irreversible' }, { status: 'sent' }),
+      ]);
+      await fx.engine.checkpoint(id);
+
+      const result = await fx.engine.rollback(refOf(c1));
+      expect(result.warnings.map((warning) => warning.type)).toEqual(['email.send']);
+      await writeFiles(fx.engine.worktreePath(id), { 'app.txt': 'v3\n' });
+      const c3 = await fx.engine.checkpoint(id);
+
+      expect(c3).toMatchObject({ checkpoint_id: 'c_3', parent_checkpoint_id: 'c_1' });
+      const state3 = await fx.backend.getState({ run_id: id, checkpoint_id: 'c_3' });
+      expect(state3.pending_intent.map((intent) => [intent.kind, intent.intent_id, intent.status])).toEqual([
+        ['tool', 'call_read', 'completed'],
+        ['side_effect', 'se_email', 'completed'],
+      ]);
+      expect(state3.pending_intent.find((intent) => intent.intent_id === 'se_email')?.requested_seq).toBeGreaterThan(c1.ledger_seq);
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });

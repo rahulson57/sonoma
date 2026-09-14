@@ -1,4 +1,6 @@
 /** Checkpoint Engine contract types (SPEC-006 "Contract"). */
+// Type only (DEC-030): the Distiller owns DistillRequest; the engine never imports src/distill at runtime.
+import type { DistillRequest } from '../distill/index.js';
 import type { AgentStateObject, Checkpoint, PendingIntent, SideEffect } from '../model/types.js';
 
 /** SPEC-006 `CheckpointRef = { runId: string; checkpointId: string }` (CLI form `run_x:c_17`). */
@@ -60,20 +62,12 @@ export interface ReplayOptions {
   readonly exact: boolean;
 }
 
-/** The port message a labelled checkpoint emits for the Distiller (SPEC-006, DEC-006). */
-export interface DistillRequest {
-  readonly run_id: string;
-  readonly checkpoint_id: string;
-  readonly label: string;
-  readonly ledger_seq: number;
-  readonly state_hash: string;
-  readonly workspace_commit: string;
-}
-
 /**
- * Where distillation requests go. The engine calls `request` only after `checkpoint()` has returned,
- * never awaits it, and ignores its failures: checkpointing never waits on a model.
+ * Where distillation requests go (SPEC-006 `distillRequest`, DEC-006, DEC-030). The message is the Distiller's own
+ * DistillRequest, equal to its distillRequestFor(checkpoint, parent). Checkpoint ids repeat across runs, so the run
+ * travels as call context. The engine calls `request` only after `checkpoint()` has returned, never awaits it, and
+ * ignores its failures: checkpointing never waits on a model.
  */
 export interface DistillRequestPort {
-  request(message: DistillRequest): void | Promise<void>;
+  request(message: DistillRequest, context: { readonly runId: string }): void | Promise<void>;
 }

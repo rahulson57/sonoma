@@ -141,9 +141,18 @@ describe('replay(ref, {exact: true})', () => {
 
     const networking = /(?:from\s+|import\s*\(\s*|require\s*\(\s*)['"](?:node:)?(?:net|tls|http|https|http2|dgram|dns|dns\/promises|undici)['"]/;
     const providerSdk = /['"](?:@anthropic-ai\/[^'"]*|openai|@google\/generative-ai|@aws-sdk\/[^'"]*|[^'"]*\/distill\/[^'"]*)['"]/;
+    // DEC-030: a whole-statement `import type { … } from '…/distill/…'` is erased at compile time, so it is the one
+    // allowed reference to the Distiller. `import { type X }` still leaves a runtime import behind and is refused.
+    const typeOnlyDistillImport = /^import\s+type\s+\{[^}]*\}\s+from\s+['"][^'"]*\/distill\/[^'"]*['"];?[ \t]*$/gm;
+    const scrub = (source: string): string => source.replace(typeOnlyDistillImport, '');
+    expect(providerSdk.test(scrub(`import type { DistillRequest } from '../distill/index.js';`))).toBe(false);
+    expect(providerSdk.test(scrub(`import { distill } from '../distill/index.js';`))).toBe(true);
+    expect(providerSdk.test(scrub(`import { type DistillRequest } from '../distill/index.js';`))).toBe(true);
+    expect(providerSdk.test(scrub(`const d = await import('../distill/index.js');`))).toBe(true);
+
     const offenders: string[] = [];
     for (const file of files) {
-      const source = await readFile(file, 'utf8');
+      const source = scrub(await readFile(file, 'utf8'));
       if (networking.test(source) || providerSdk.test(source) || /\bfetch\s*\(/.test(source) || /\bWebSocket\b/.test(source)) {
         offenders.push(path.relative(root, file));
       }

@@ -17,6 +17,7 @@
  * - the workspace: the user's worktree root until the run has an execution worktree (after
  *   `agent.resumed`, `agent.rolled_back` or `agent.forked`);
  * - the tool / side-effect events that pending intent and side-effect warnings are derived from;
+ * - the restores (`agent.resumed`, `agent.rolled_back`) whose abandoned ledger windows pending intent skips (DEC-031);
  * - cumulative token usage from `model.responded`.
  * So a fresh process (after `kill -9`) reaches the same view from the durable ledger.
  *
@@ -30,8 +31,8 @@
 import { stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { derivePendingIntent } from '../ledger/pending-intent.js';
-import { pendingIntentAt } from './resume-intent.js';
+// Type only (DEC-030): the Distiller owns DistillRequest; the engine never imports src/distill at runtime.
+import type { DistillRequest } from '../distill/index.js';
 import { verifyChain } from '../ledger/verify-chain.js';
 import type { Checkpoint, LedgerEvent, LedgerEventDraft, Run, SideEffect } from '../model/types.js';
 import { sanitize } from '../redact/index.js';
@@ -43,13 +44,13 @@ import { diffJson } from './json-patch.js';
 import { lineagePayload } from './lineage.js';
 import { sanitizePayload } from './observations.js';
 import { assertRunId, toStorageRef } from './refs.js';
+import { abandonedWindows, pendingIntentAt, type LineageMark } from './resume-intent.js';
 import { deriveSideEffects } from './side-effects.js';
 import { MAX_SNAPSHOT_FILE_BYTES, buildSnapshot, type SnapshotCache } from './snapshot.js';
 import type {
   CheckpointDiff,
   CheckpointOptions,
   CheckpointRef,
-  DistillRequest,
   DistillRequestPort,
   ReplayOptions,
   RestoredCheckpoint,
@@ -100,6 +101,8 @@ interface RunView {
   forkedFrom: ForkOrigin | null;
   forkCommit: string | null;
   readonly intentEvents: LedgerEvent[];
+  /** Every `agent.resumed` / `agent.rolled_back`, in seq order (DEC-031). */
+  readonly lineage: LineageMark[];
   usage: { input_tokens: number; output_tokens: number };
   cache: SnapshotCache | undefined;
 }
@@ -232,17 +235,15 @@ export class CheckpointEngine {
     if (rawLabel !== null && (typeof rawLabel !== 'string' || rawLabel === '')) throw invalid('label is a non-empty string or null');
     const label = rawLabel === null ? null : sanitize(rawLabel).output;
 
-    const checkpoint = await this.#serial(runId, async () => {
+    const { created: checkpoint, parent } = await this.#serial(runId, async () => {
       const view = await this.#view(runId);
       const workspaceDir = this.#workspaceOf(runId, view);
       if (!(await stat(workspaceDir).catch(() => undefined))?.isDirectory()) {
         throw new EngineError('ERR_WORKSPACE', `the workspace of ${runId} (${workspaceDir}) is missing; resume or fork a checkpoint to restore it`);
       }
       const parentId = view.currentCheckpointId;
-      const parentCommit =
-        parentId !== null
-          ? (await this.#backend.getCheckpoint({ run_id: runId, checkpoint_id: parentId })).workspace_commit
-          : view.forkCommit;
+      const parent = parentId !== null ? await this.#backend.getCheckpoint({ run_id: runId, checkpoint_id: parentId }) : null;
+      const parentCommit = parent !== null ? parent.workspace_commit : view.forkCommit;
 
       const snapshot = await buildSnapshot({
         workspaceDir,
@@ -275,7 +276,8 @@ export class CheckpointEngine {
           run_id: runId,
           parent_checkpoint_id: parentId,
           label,
-          pending_intent: derivePendingIntent(view.intentEvents),
+          // As of the history this workspace descends from; side effects as of head (DEC-031).
+          pending_intent: pendingIntentAt(view.intentEvents, abandonedWindows(view.lineage, view.seq, view.seq)),
           usage: { ...view.usage },
           stagingDir: snapshot.stagingDir,
           ...(snapshot.changes === undefined ? {} : { changes: snapshot.changes }),
@@ -286,7 +288,7 @@ export class CheckpointEngine {
           view.currentCheckpointId = created.checkpoint_id;
         }
         view.cache = { workspaceDir, baseCommit: created.workspace_commit, files: snapshot.files };
-        return created;
+        return { created, parent };
       } catch (err) {
         view.cache = undefined;
         throw err;
@@ -295,13 +297,14 @@ export class CheckpointEngine {
       }
     });
 
-    if (label !== null && this.#distill !== undefined) this.#emitDistillRequest(this.#distill, checkpoint, label);
+    if (label !== null && this.#distill !== undefined) this.#emitDistillRequest(this.#distill, checkpoint, parent);
     return checkpoint;
   }
 
   /**
    * Check the checkpoint's workspace out into the run's execution worktree, load its state, recompute pending
-   * intent from ledger acknowledgements as of the checkpoint's cursor (DEC-025, see resume-intent.ts), and
+   * intent from ledger acknowledgements as of the checkpoint's history (tools, DEC-025) and the ledger head (side
+   * effects, DEC-031; see resume-intent.ts), and
    * emit `agent.resumed`. Never replays the transcript.
    */
   async resume(ref: CheckpointRef): Promise<RestoredCheckpoint> {
@@ -319,8 +322,8 @@ export class CheckpointEngine {
       await this.#git.materialize(worktreePath, checkpoint.workspace_commit);
 
       const view = await this.#view(at.run_id);
-      // As of the checkpoint's cursor, plus later requests that were never resolved (DEC-025).
-      const pendingIntent = pendingIntentAt(view.intentEvents, checkpoint.ledger_seq);
+      // Tools as of the checkpoint's history plus later unresolved requests (DEC-025); side effects as of head (DEC-031).
+      const pendingIntent = pendingIntentAt(view.intentEvents, abandonedWindows(view.lineage, checkpoint.ledger_seq, view.seq));
       const event = await this.#backend.appendEvent(at.run_id, { type: 'agent.resumed', actor: 'runtime', payload });
       this.#fold(view, event);
       return { checkpoint, state, worktreePath, pendingIntent };
@@ -429,19 +432,20 @@ export class CheckpointEngine {
 
   // ── internals ───────────────────────────────────────────────────────────────────────────────────
 
-  #emitDistillRequest(port: DistillRequestPort, checkpoint: Checkpoint, label: string): void {
-    const message: DistillRequest = {
-      run_id: checkpoint.run_id,
-      checkpoint_id: checkpoint.checkpoint_id,
-      label,
-      ledger_seq: checkpoint.ledger_seq,
-      state_hash: checkpoint.state_hash,
-      workspace_commit: checkpoint.workspace_commit,
-    };
+  /** `parent` is the same-run parent checkpoint (null for a run's first checkpoint, a fork's included). */
+  #emitDistillRequest(port: DistillRequestPort, checkpoint: Checkpoint, parent: Checkpoint | null): void {
     // Fire and forget, after checkpoint() has returned: a port never delays or fails a checkpoint.
     setImmediate(() => {
       try {
-        const pending = port.request(message);
+        // Exactly the Distiller's distillRequestFor(checkpoint, parent) (DEC-030). Checkpoint ids repeat across
+        // runs, so the run travels as call context, not in the message.
+        const message: DistillRequest = {
+          checkpointId: checkpoint.checkpoint_id,
+          stateHash: checkpoint.state_hash,
+          ledgerRange: [parent === null ? 0 : parent.ledger_seq, checkpoint.ledger_seq],
+          workspaceCommit: checkpoint.workspace_commit,
+        };
+        const pending = port.request(message, { runId: checkpoint.run_id });
         if (pending !== undefined && typeof pending.then === 'function') pending.then(undefined, () => undefined);
       } catch {
         // ignored by design (DEC-006: distillation is decoupled from the durability path)
@@ -479,6 +483,7 @@ export class CheckpointEngine {
         forkedFrom: null,
         forkCommit: null,
         intentEvents: [],
+        lineage: [],
         usage: { input_tokens: 0, output_tokens: 0 },
         cache: undefined,
       };
@@ -502,6 +507,7 @@ export class CheckpointEngine {
       case 'agent.resumed':
       case 'agent.rolled_back':
         if (typeof payload['checkpoint_id'] === 'string') view.currentCheckpointId = payload['checkpoint_id'];
+        if (typeof payload['ledger_seq'] === 'number') view.lineage.push({ seq: event.seq, target: payload['ledger_seq'] });
         view.workspace = 'execution';
         view.cache = undefined;
         break;

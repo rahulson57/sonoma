@@ -9,7 +9,7 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { CheckpointEngine } from '../../../src/engine/index.js';
-import type { PendingIntent } from '../../../src/model/types.js';
+import type { LedgerEventDraft, PendingIntent } from '../../../src/model/types.js';
 import { LocalBackend } from '../../../src/storage/index.js';
 import { allEvents, engineFixture, git, writeFiles } from './support.js';
 
@@ -147,4 +147,87 @@ describe('resume()', () => {
       await fx.cleanup();
     }
   });
+
+  it('DEC-031: side effects are never filtered: resume(c_1) reports an irreversible effect committed after c_1 as completed', async () => {
+    const fx = await engineFixture({ files: { 'src/app.ts': 'export const v = 1;\n' } });
+    try {
+      const { runId, c1 } = await editAndEmailAfterC1(fx);
+
+      const restored = await fx.engine.resume({ runId, checkpointId: 'c_1' });
+
+      expect(intentPairs(restored.pendingIntent)).toEqual([
+        ['tool', 'call_read', 'completed'],
+        ['side_effect', 'se_email', 'completed'],
+        ['tool', 'call_late', 'in_progress'],
+      ]);
+      const email = restored.pendingIntent.find((intent) => intent.intent_id === 'se_email');
+      expect(email?.requested_seq).toBeGreaterThan(c1.ledger_seq);
+      expect(email?.resolved_seq).toBeGreaterThan(c1.ledger_seq);
+      // The managed edit acknowledged after c_1 is still not reported (DEC-025).
+      expect(restored.pendingIntent.some((intent) => intent.intent_id === 'call_edit')).toBe(false);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it('DEC-031: checkpoint() after resume(c_1) records call_edit as not completed and se_email as completed, and resume(c_3) agrees with c_3', async () => {
+    const fx = await engineFixture({ files: { 'src/app.ts': 'export const v = 1;\n' } });
+    try {
+      const { runId } = await editAndEmailAfterC1(fx);
+      const restored = await fx.engine.resume({ runId, checkpointId: 'c_1' });
+      await writeFiles(restored.worktreePath, { 'src/app.ts': 'export const v = 3;\n' });
+      await fx.engine.record([
+        { run_id: runId, type: 'tool.requested', actor: 'agent', payload: { tool_call_id: 'call_next', tool: 'Edit' } } as LedgerEventDraft,
+        { run_id: runId, type: 'tool.completed', actor: 'runtime', payload: { tool_call_id: 'call_next', stdout: 'edited\n' } } as LedgerEventDraft,
+      ]);
+
+      const c3 = await fx.engine.checkpoint(runId);
+
+      expect(c3).toMatchObject({ checkpoint_id: 'c_3', parent_checkpoint_id: 'c_1' });
+      const state3 = await fx.backend.getState({ run_id: runId, checkpoint_id: 'c_3' });
+      expect(intentPairs(state3.pending_intent)).toEqual([
+        ['tool', 'call_read', 'completed'],
+        ['side_effect', 'se_email', 'completed'],
+        ['tool', 'call_late', 'in_progress'],
+        ['tool', 'call_next', 'completed'],
+      ]);
+      expect(state3.pending_intent.some((intent) => intent.intent_id === 'call_edit')).toBe(false);
+
+      // resume(c_3) keeps the earlier restore's window: up to its cursor it reports exactly c_3's recorded state.
+      const atC3 = await fx.engine.resume({ runId, checkpointId: 'c_3' });
+      expect(atC3.pendingIntent.filter((intent) => intent.requested_seq <= c3.ledger_seq)).toEqual(state3.pending_intent);
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
+
+type Fixture = Awaited<ReturnType<typeof engineFixture>>;
+
+const intentPairs = (intents: readonly PendingIntent[]): Array<[string, string | null, string]> =>
+  intents.map((intent) => [intent.kind, intent.intent_id, intent.status]);
+
+/** call_read → c_1 → an edit (call_edit) and an irreversible email (se_email), both acknowledged → c_2 → call_late, never acknowledged. */
+async function editAndEmailAfterC1(fx: Fixture) {
+  const runId = (await fx.engine.startRun({ agent: 'claude-code' })).run_id;
+  const draft = (type: string, payload: Record<string, unknown>): LedgerEventDraft =>
+    ({ run_id: runId, type, actor: type.endsWith('.requested') ? 'agent' : 'runtime', payload }) as LedgerEventDraft;
+
+  await fx.engine.record([
+    draft('tool.requested', { tool_call_id: 'call_read', tool: 'Read' }),
+    draft('tool.completed', { tool_call_id: 'call_read', stdout: 'ok\n' }),
+  ]);
+  const c1 = await fx.engine.checkpoint(runId);
+
+  await writeFiles(fx.repo.dir, { 'src/app.ts': 'export const v = 2;\n' });
+  await fx.engine.record([
+    draft('tool.requested', { tool_call_id: 'call_edit', tool: 'Edit' }),
+    draft('tool.completed', { tool_call_id: 'call_edit', stdout: 'edited\n' }),
+    draft('side_effect.requested', { side_effect_id: 'se_email', type: 'email.send', target: 'ops@example.invalid', reversibility: 'irreversible' }),
+    draft('side_effect.committed', { side_effect_id: 'se_email', status: 'sent' }),
+  ]);
+  const c2 = await fx.engine.checkpoint(runId);
+
+  await fx.engine.record([draft('tool.requested', { tool_call_id: 'call_late', tool: 'Bash' })]);
+  return { runId, c1, c2 };
+}

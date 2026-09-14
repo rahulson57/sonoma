@@ -12,7 +12,6 @@ export type {
   CheckpointDiff,
   CheckpointOptions,
   CheckpointRef,
-  DistillRequest,
   DistillRequestPort,
   JsonPatch,
   JsonPatchOperation,

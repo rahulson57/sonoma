@@ -4,7 +4,8 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
-import type { DistillRequest, DistillRequestPort } from '../../../src/engine/index.js';
+import type { DistillRequest } from '../../../src/distill/index.js';
+import type { DistillRequestPort } from '../../../src/engine/index.js';
 import type { DistillerProvider } from '../../helpers/providerStub.js';
 import { engineFixture, flushImmediates, writeFiles } from '../../integration/engine/support.js';
 
@@ -19,15 +20,15 @@ function spyProvider(): DistillerProvider & { complete: ReturnType<typeof vi.fn>
 describe('distillation trigger', () => {
   it('an unlabeled checkpoint emits no distillRequest and a labeled one emits exactly one, with a spy provider call count of 0 inside checkpoint()', async () => {
     const provider = spyProvider();
-    const requests: DistillRequest[] = [];
+    const requests: Array<{ message: DistillRequest; context: { readonly runId: string } }> = [];
     let insideCheckpoint = false;
     let providerCallsInsideCheckpoint = 0;
     // A port that would distill straight away: it calls the provider as soon as it gets a request.
     const port: DistillRequestPort = {
-      request: vi.fn((message: DistillRequest) => {
-        requests.push(message);
+      request: vi.fn((message: DistillRequest, context: { readonly runId: string }) => {
+        requests.push({ message, context });
         if (insideCheckpoint) providerCallsInsideCheckpoint += 1;
-        void provider.complete(`distill ${message.checkpoint_id}`);
+        void provider.complete(`distill ${message.checkpointId}`);
       }),
     };
     const fx = await engineFixture({ files: { 'a.txt': 'a\n' }, engine: { distill: port } });
@@ -53,14 +54,16 @@ describe('distillation trigger', () => {
 
       await flushImmediates();
       expect(port.request).toHaveBeenCalledTimes(1);
+      // DEC-030: the Distiller's DistillRequest (its range starts at the parent's cursor), with the run as context.
       expect(requests).toEqual([
         {
-          run_id: run.run_id,
-          checkpoint_id: labeled.checkpoint_id,
-          label: 'milestone: tests pass',
-          ledger_seq: labeled.ledger_seq,
-          state_hash: labeled.state_hash,
-          workspace_commit: labeled.workspace_commit,
+          message: {
+            checkpointId: labeled.checkpoint_id,
+            stateHash: labeled.state_hash,
+            ledgerRange: [unlabeled.ledger_seq, labeled.ledger_seq],
+            workspaceCommit: labeled.workspace_commit,
+          },
+          context: { runId: run.run_id },
         },
       ]);
       expect(providerCallsInsideCheckpoint).toBe(0);
