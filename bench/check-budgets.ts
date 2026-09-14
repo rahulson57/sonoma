@@ -5,18 +5,21 @@
  *
  * Reads every BenchResult (bench/results.schema.ts) and checks it against the SPEC-002 budget table:
  *   - a budgeted scenario fails when p95Ms > budgetMs;
+ *   - a budgeted scenario with ANY phase `null` (not measured) fails with `NOT MEASURED <scenario>: <phases>`,
+ *     whatever its p95Ms: an unmeasured phase is never a pass (DEC-049(1), DEC-050(3));
  *   - a budgeted scenario missing from the results fails, because an unmeasured envelope is not a pass;
  *   - an entry whose budgetMs differs from the table fails, because scenarios never define budgets;
- *   - scenarios with budgetMs null (d-secret-output) are reported with their phases, never failed.
+ *   - scenarios with budgetMs null (d-secret-output) are reported with their phases, nulls included, never failed.
  * Every line names its scenario. The per-phase breakdown marks a phase that dominates the total.
  *
- * Exit codes: 0 = every budgeted scenario is present and within budget;
- *             1 = a scenario is over budget, missing, has a mismatched budget, or results are malformed;
+ * Exit codes: 0 = every budgeted scenario is present, fully measured and within budget;
+ *             1 = a scenario is over budget, not fully measured, missing, has a mismatched budget, or results
+ *                 are malformed;
  *             2 = usage error, or the results file cannot be read or parsed.
  */
 import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { BUDGETS, isKnownScenario, PHASES, readBenchResults, type BenchResult } from './results.schema.js';
+import { BUDGETS, isKnownScenario, PHASES, readBenchResults, unmeasuredPhases, type BenchResult } from './results.schema.js';
 
 export interface Evaluation {
   ok: boolean;
@@ -29,10 +32,14 @@ const ms = (v: number): string => `${v.toFixed(1)} ms`;
 const budgetText = (v: number | null): string => (v === null ? 'null (reported)' : ms(v));
 
 function phaseBreakdown(result: BenchResult): string {
-  const total = PHASES.reduce((sum, p) => sum + result.phases[p], 0);
+  const unmeasured = unmeasuredPhases(result);
+  // With a phase unmeasured the measured sum is not the whole, so no phase can be called dominant.
+  const total = unmeasured.length > 0 ? 0 : PHASES.reduce((sum, p) => sum + (result.phases[p] ?? 0), 0);
   const parts = PHASES.map((p) => {
-    const dominant = total > 0 && result.phases[p] / total > 0.5;
-    return `${p} ${ms(result.phases[p])}${dominant ? ' (dominant)' : ''}`;
+    const value = result.phases[p];
+    if (value === null) return `${p} not measured`;
+    const dominant = total > 0 && value / total > 0.5;
+    return `${p} ${ms(value)}${dominant ? ' (dominant)' : ''}`;
   });
   return `      phases (p95): ${parts.join(' | ')}`;
 }
@@ -50,6 +57,7 @@ export function evaluate(report: unknown): Evaluation {
   for (const { where, result } of results) {
     const { scenario, budgetMs, p95Ms } = result;
     const label = `${scenario} [${where}]`;
+    const unmeasured = unmeasuredPhases(result);
     if (!isKnownScenario(scenario)) {
       lines.push(`INFO ${label}: not a SPEC-002 scenario; p95 ${ms(p95Ms)}, no budget applied`);
     } else {
@@ -58,12 +66,21 @@ export function evaluate(report: unknown): Evaluation {
         failed.add(scenario);
         lines.push(`FAIL ${label}: budgetMs ${budgetText(budgetMs)} does not match the SPEC-002 budget ${budgetText(expected)}`);
       } else if (expected === null) {
-        lines.push(`INFO ${label}: p95 ${ms(p95Ms)} (reported, not budgeted)`);
-      } else if (p95Ms > expected) {
-        failed.add(scenario);
-        lines.push(`FAIL ${label}: p95 ${ms(p95Ms)} is over budget ${ms(expected)}`);
+        const note = unmeasured.length > 0 ? `; not measured: ${unmeasured.join(', ')}` : '';
+        lines.push(`INFO ${label}: p95 ${ms(p95Ms)} (reported, not budgeted)${note}`);
       } else {
-        lines.push(`PASS ${label}: p95 ${ms(p95Ms)} within budget ${ms(expected)}`);
+        if (unmeasured.length > 0) {
+          failed.add(scenario);
+          lines.push(`NOT MEASURED ${scenario}: ${unmeasured.join(', ')}`);
+        }
+        if (p95Ms > expected) {
+          failed.add(scenario);
+          lines.push(`FAIL ${label}: p95 ${ms(p95Ms)} is over budget ${ms(expected)}`);
+        } else if (unmeasured.length > 0) {
+          lines.push(`FAIL ${label}: p95 ${ms(p95Ms)} is within budget ${ms(expected)}, but not a pass while phases are not measured`);
+        } else {
+          lines.push(`PASS ${label}: p95 ${ms(p95Ms)} within budget ${ms(expected)}`);
+        }
       }
     }
     lines.push(phaseBreakdown(result));
@@ -81,7 +98,9 @@ export function evaluate(report: unknown): Evaluation {
   }
 
   const ok = failed.size === 0;
-  lines.push(ok ? 'bench:check OK: every budgeted scenario is within budget' : `bench:check FAILED: ${[...failed].join(', ')}`);
+  lines.push(
+    ok ? 'bench:check OK: every budgeted scenario is fully measured and within budget' : `bench:check FAILED: ${[...failed].join(', ')}`,
+  );
   return { ok, failed: [...failed], lines };
 }
 

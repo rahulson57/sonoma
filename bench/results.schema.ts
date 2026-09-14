@@ -22,8 +22,13 @@ export const PHASES = [
 
 export type Phase = (typeof PHASES)[number];
 
-/** Per-phase latency in milliseconds (the phase's p95 over the measured iterations). */
-export type PhaseTimings = Record<Phase, number>;
+/**
+ * Per-phase latency in milliseconds (the phase's p95 over the measured iterations), or `null` when the
+ * phase was NOT MEASURED (operator ruling MSG-3495 / DEC-049(1), DEC-050). All 7 keys are always present.
+ * An unmeasured phase is `null`, never `0`: a zero would claim a measurement that did not happen.
+ * `null` is never a pass: bench/check-budgets.ts fails a budgeted scenario with any null phase.
+ */
+export type PhaseTimings = Record<Phase, number | null>;
 
 export interface BenchResult {
   /** Scenario id, e.g. "a-small-change". */
@@ -50,6 +55,11 @@ export const BUDGETS: Readonly<Record<string, number | null>> = Object.freeze({
 
 export function isKnownScenario(id: string): boolean {
   return Object.hasOwn(BUDGETS, id);
+}
+
+/** The phases a result reports as NOT MEASURED (`null`), in PHASES order. */
+export function unmeasuredPhases(result: Pick<BenchResult, 'phases'>): Phase[] {
+  return PHASES.filter((phase) => result.phases[phase] === null);
 }
 
 /** A BenchResult plus where it was found in the report, for messages. */
@@ -80,7 +90,9 @@ export function validateBenchResult(value: unknown, where: string): string[] {
   }
   for (const phase of PHASES) {
     if (!(phase in value.phases)) errors.push(`${where}: missing phase timing "${phase}"`);
-    else if (!isDuration(value.phases[phase])) errors.push(`${where}: phases.${phase} must be a finite number >= 0`);
+    else if (value.phases[phase] !== null && !isDuration(value.phases[phase])) {
+      errors.push(`${where}: phases.${phase} must be a finite number >= 0, or null when not measured`);
+    }
   }
   const known = new Set<string>(PHASES);
   for (const key of Object.keys(value.phases)) {
