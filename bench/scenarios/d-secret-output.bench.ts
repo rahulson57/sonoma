@@ -4,7 +4,8 @@
  *
  * Each iteration records one `tool.completed` observation whose stdout is ~10 MiB with a fake credential from the
  * shared corpus on every other line, then takes the automatic checkpoint that carries it. The sample runs from the
- * record() call to the checkpoint ACK; scanRedact is the record() call up to its ledger append (sanitizePayload).
+ * record() call to the checkpoint ACK; scanRedact is the record() call up to its ledger append (sanitizePayload plus
+ * O(1) validation), so the reported scanRedact is an UPPER BOUND on that phase (DEC-051(2)).
  * Phases the harness cannot measure are null (see support/harness.ts).
  */
 import { bench, describe } from 'vitest';

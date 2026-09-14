@@ -11,14 +11,16 @@
  * splits into exactly 4 honestly measurable buckets:
  *
  *   checkpoint() call ── createCheckpoint() call ── afterRefWrite ── afterCheckpointEvent ── createCheckpoint() return ── ACK
- *        │ beforeStorage (merged) │ storageToRef (merged)  │ ledgerAppend           │ indexUpdate               │ afterStorage
+ *        │ beforeStorage (merged) │ storageToRef (merged)  │ ledgerAppend           │ indexUpdate               │ (in p95Ms only)
  *
  * - `ledgerAppend`  = afterRefWrite → afterCheckpointEvent: seal + durable append of checkpoint.created. One phase.
  * - `indexUpdate`   = afterCheckpointEvent → createCheckpoint returns: the index transaction. One phase.
  * - `beforeStorage` = snapshot work (changeDetection + scanRedact + hash + staging writes) and `storageToRef`
  *   (writer lock, git objects/tree/commit, state-blob CAS write, ref write) each MERGE several SPEC-002 phases.
- *   They are reported only under `unattributedP95Ms`, never under a phase key: a merged span under a documented
- *   key would launder a 4-bucket measurement as a 7-phase one (rejected in MSG-3495).
+ *   They are DIAGNOSTIC only (DEC-051(1)): reported solely as `unattributedP95Ms: {beforeStorage, storageToRef}`
+ *   beside the BenchResult fields (see support/spans.ts), never under a phase key: a merged span under a documented
+ *   key would launder a 4-bucket measurement as a 7-phase one (rejected in MSG-3495). bench:check never reads them.
+ *   The engine's work after createCheckpoint returns is inside p95Ms only; it is not reported as a span.
  * So `changeDetection`, `scanRedact`, `hash`, `blobWrite` and `gitCommit` are null for checkpoint scenarios, and
  * bench:check reports every budgeted scenario NOT MEASURED until the hook lands. When any other ledger append
  * happens inside the window (e.g. a `workspace.file_skipped`), its ledger and index work sits outside the two
@@ -46,7 +48,7 @@ import { secretCorpus } from '../../../tests/helpers/fakeSecrets.js';
 import { seededRng } from '../../../tests/helpers/prng.js';
 import { TMP_REPO_PREFIX, tmpGitRepo, type TmpGitRepo } from '../../../tests/helpers/tmpRepo.js';
 import type { CheckpointSample, PhaseDurations, PhaseRecorder } from '../../phases.js';
-import { percentile } from '../../phases.js';
+import { unattributedP95, type UnattributedSpans } from './spans.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -181,9 +183,9 @@ export class ProbedBackend implements StorageBackend {
   }
 }
 
-/** One measured sample: SPEC-002 fields plus merged spans that are explicitly NOT phases. */
+/** One measured sample: SPEC-002 fields plus the DIAGNOSTIC merged spans, explicitly NOT phases (null = none). */
 export interface MeasuredSample extends CheckpointSample {
-  unattributed: Record<string, number>;
+  unattributed: UnattributedSpans | null;
 }
 
 const unmeasured = (): PhaseDurations => ({
@@ -261,7 +263,6 @@ export async function measureCheckpoint(store: Store, runId: string): Promise<Me
       unattributed: {
         beforeStorage: createStart - start,
         storageToRef: need(w, 'refWritten') - createStart,
-        afterStorage: ack - need(w, 'createEnd'),
       },
     };
   } finally {
@@ -272,28 +273,23 @@ export async function measureCheckpoint(store: Store, runId: string): Promise<Me
 /**
  * record() of one observation, then checkpoint(): the automatic checkpoint boundary that carries a tool output.
  * `scanRedact` = record() call → its appendEvent call: sanitizePayload plus O(1) validation and queueing, with no
- * other backend call in between (else null). The observation's own append (ledger + CAS offload + index) is a
- * ledger append outside the seams, so ledgerAppend and indexUpdate are null.
+ * other backend call in between (else null). It is an UPPER BOUND on scanRedact (DEC-051(2)): the window also holds
+ * that O(1) validation, so the true phase is at most this value. The observation's own append (ledger + CAS offload
+ * + index) is a ledger append outside the seams, so ledgerAppend and indexUpdate are null. No merged spans are
+ * reported for this measurement: DEC-051(1) approves only the checkpoint spans.
  */
 export async function measureRecordThenCheckpoint(store: Store, draft: LedgerEventDraft): Promise<MeasuredSample> {
   const w = store.probe.open();
   try {
     const start = performance.now();
     await store.engine.record([draft]);
-    const recorded = performance.now();
     await store.engine.checkpoint(draft.run_id);
     const ack = performance.now();
     const phases = checkpointPhases(w);
     const firstAppend = need(w, 'firstAppend');
+    // UPPER BOUND on scanRedact (DEC-051(2)); stays null when any other backend call came first.
     if (w.callsBeforeFirstAppend === 0) phases.scanRedact = firstAppend - start;
-    return {
-      totalMs: ack - start,
-      phases,
-      unattributed: {
-        observationAppend: recorded - firstAppend,
-        checkpoint: ack - recorded,
-      },
-    };
+    return { totalMs: ack - start, phases, unattributed: null };
   } finally {
     store.probe.close();
   }
@@ -315,13 +311,14 @@ type Hook = (task: object, mode: string) => void | Promise<void>;
 /**
  * Wires a scenario into vitest `bench()`: the recorder's hooks plus one-time preparation (tinybench awaits
  * `setup`) and synchronous removal of the workspace when the measured run ends (tinybench does not await
- * `teardown`). Also attaches `unattributedP95Ms`, the p95 of each merged span, next to the BenchResult fields.
+ * `teardown`). Also attaches `unattributedP95Ms: {beforeStorage, storageToRef}`, the p95 of each DIAGNOSTIC merged
+ * span, beside the BenchResult fields (never under a phase key; DEC-051(1)); omitted when the samples carry none.
  */
 export function scenarioBench<S>(scenario: string, recorder: PhaseRecorder, spec: ScenarioSpec<S>) {
   let prepared: Promise<{ ws: BenchRepo; state: S }> | undefined;
   let ws: BenchRepo | undefined;
   let iteration = 0;
-  let spans: Array<Record<string, number>> = [];
+  let spans: Array<UnattributedSpans | null> = [];
 
   const setup: Hook = async (task, mode) => {
     recorder.options.setup(task, mode);
@@ -337,13 +334,11 @@ export function scenarioBench<S>(scenario: string, recorder: PhaseRecorder, spec
     if (mode !== 'run') return;
     try {
       recorder.options.teardown(task, mode);
-      const keys = Object.keys(spans[0] ?? {});
-      const target = task as { result?: Record<string, unknown> };
-      target.result = {
-        ...(target.result ?? {}),
-        unattributedP95Ms: Object.fromEntries(keys.map((key) => [key, percentile(spans.map((s) => s[key] ?? 0), 95)])),
-        unattributedNote: 'merged spans, NOT SPEC-002 phases; see bench/scenarios/support/harness.ts',
-      };
+      const unattributedP95Ms = unattributedP95(spans);
+      if (unattributedP95Ms !== null) {
+        const target = task as { result?: Record<string, unknown> };
+        target.result = { ...(target.result ?? {}), unattributedP95Ms };
+      }
     } finally {
       ws?.removeSync();
     }
