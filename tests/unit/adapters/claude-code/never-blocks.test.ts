@@ -16,6 +16,7 @@ import {
   createHookHandler,
 } from '../../../../src/adapters/claude-code/index.js';
 import { StorageError } from '../../../../src/storage/errors.js';
+import { secretCorpus } from '../../../helpers/fakeSecrets.js';
 import { FakeEngine, FIXTURES, fixture, harness, RUN_ID, scriptedStatus } from './support.js';
 
 describe('handleHook never blocks the agent', () => {
@@ -220,7 +221,8 @@ describe('handleHook never blocks the agent', () => {
         sleep: async () => undefined,
         stderr: (line) => stderr.push(line),
       });
-      const prompt = { ...fixture(FIXTURES.UserPromptSubmit), prompt: 'my token is ghp_notReallyASecretButPayloadData' };
+      const token = secretCorpus().find((e) => e.kind === 'github')!.value;
+      const prompt = { ...fixture(FIXTURES.UserPromptSubmit), prompt: `my token is ${token}` };
       await expect(handler.handleHook(prompt)).resolves.toBeNull();
       await expect(handler.handleHook(fixture(FIXTURES.Stop))).resolves.toBeNull();
       await expect(handler.handleHook('garbage')).resolves.toBeNull();
@@ -231,7 +233,7 @@ describe('handleHook never blocks the agent', () => {
         'ckpt hook Stop: observation not recorded (ERR_RUN_LOCKED)\n',
         'ckpt hook (unparsed): observation not recorded (ERR_RUN_LOCKED)\n',
       ]);
-      expect(stderr.join('')).not.toContain('ghp_');
+      expect(stderr.join('')).not.toContain(token);
     });
 
     it('does not retry other errors', async () => {
