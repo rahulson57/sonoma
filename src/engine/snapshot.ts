@@ -215,26 +215,85 @@ function reportPhase(timer: { add(phase: CheckpointPhase, ms: number): void }, p
   }
 }
 
+/** The phases `buildSnapshot` times, in the order they are reported. Storage times the other three. */
+type SnapshotPhase = Extract<CheckpointPhase, 'changeDetection' | 'scanRedact' | 'hash' | 'blobWrite'>;
+const SNAPSHOT_PHASES: readonly SnapshotPhase[] = ['changeDetection', 'scanRedact', 'hash', 'blobWrite'];
+
+/**
+ * `buildSnapshot`'s phase clock. `start()` opens an interval; `lap(phase)` adds the time since the interval opened to
+ * `phase` and opens the next interval at that same instant; `flush()` reports every phase's total once, in
+ * SNAPSHOT_PHASES order. Time between a `lap()` and the next `start()` is attributed to no phase. Intervals never
+ * overlap, so the reported sum never exceeds the wall time of the `buildSnapshot` call.
+ */
+interface PhaseStopwatch {
+  start(): void;
+  lap(phase: SnapshotPhase): void;
+  flush(): void;
+}
+
+const doNothing = (): void => undefined;
+
+/** The stopwatch when no phaseTimer is set: no clock read, no allocation, nothing reported. */
+const NO_STOPWATCH: PhaseStopwatch = { start: doNothing, lap: doNothing, flush: doNothing };
+
+class TimedStopwatch implements PhaseStopwatch {
+  readonly #timer: NonNullable<SnapshotOptions['phaseTimer']>;
+  readonly #totals: Record<SnapshotPhase, number> = { changeDetection: 0, scanRedact: 0, hash: 0, blobWrite: 0 };
+  #mark = 0;
+
+  constructor(timer: NonNullable<SnapshotOptions['phaseTimer']>) {
+    this.#timer = timer;
+  }
+
+  start(): void {
+    this.#mark = performance.now();
+  }
+
+  lap(phase: SnapshotPhase): void {
+    const now = performance.now();
+    this.#totals[phase] += now - this.#mark;
+    this.#mark = now;
+  }
+
+  flush(): void {
+    for (const phase of SNAPSHOT_PHASES) reportPhase(this.#timer, phase, this.#totals[phase]);
+  }
+}
+
+function stopwatchFor(timer: SnapshotOptions['phaseTimer']): PhaseStopwatch {
+  return timer === undefined ? NO_STOPWATCH : new TimedStopwatch(timer);
+}
+
+/**
+ * Whether the stat cache's entry can stand in for `file` without reading it: the same mode, size, mtime and inode, and
+ * an mtime outside RACY_WINDOW_NS of the moment the cached entry was hashed.
+ */
+function isStatCacheHit(known: SnapshotFile | undefined, file: WorkspaceFile): known is SnapshotFile {
+  return (
+    known !== undefined &&
+    known.mode === file.mode &&
+    known.size === file.size &&
+    known.mtimeNs === file.mtimeNs &&
+    known.ino === file.ino &&
+    file.mtimeNs + RACY_WINDOW_NS < known.hashedAtNs
+  );
+}
+
 /** Build the sanitized staging tree for one checkpoint of `workspaceDir`. The caller must call `cleanup()`. */
 export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot> {
-  // Phase timing (SPEC-002). Without a timer `timing` is false: performance.now() is never called, every mark stays 0
-  // and nothing is reported. The timed intervals never overlap, so their sum never exceeds this call's wall time.
-  const timer = options.phaseTimer;
-  const timing = timer !== undefined;
-  let changeDetectionMs = 0;
-  let scanRedactMs = 0;
-  let hashMs = 0;
-  let blobWriteMs = 0;
-  let mark = timing ? performance.now() : 0;
+  // Phase timing (SPEC-002). Without a timer the stopwatch is NO_STOPWATCH, so performance.now() is never called and
+  // nothing is reported.
+  const watch = stopwatchFor(options.phaseTimer);
+  watch.start();
 
   // changeDetection: walking the workspace and stat-ing every entry.
   const { files: current, skipped } = await listWorkspace(options.workspaceDir, options);
-  if (timing) changeDetectionMs += performance.now() - mark;
+  watch.lap('changeDetection');
   const stagingDir = await mkdtemp(path.join(options.tmpDir, 'ckpt-stage-'));
   const cleanup = (): Promise<void> => rm(stagingDir, { recursive: true, force: true });
   try {
     // changeDetection: the tree this checkpoint is compared against (the stat cache, or the parent commit's tree).
-    if (timing) mark = performance.now();
+    watch.start();
     const parentCommit = options.parentCommit;
     const cached =
       parentCommit !== null && options.cache?.workspaceDir === options.workspaceDir && options.cache.baseCommit === parentCommit
@@ -246,24 +305,17 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
     const written: string[] = [];
     let hashed = 0;
     let redactedFiles = 0;
-    if (timing) changeDetectionMs += performance.now() - mark;
+    watch.lap('changeDetection');
     for (const file of current) {
       // changeDetection: the stat-cache check.
-      if (timing) mark = performance.now();
+      watch.start();
       const known = cached?.get(file.rel);
-      if (
-        known !== undefined &&
-        known.mode === file.mode &&
-        known.size === file.size &&
-        known.mtimeNs === file.mtimeNs &&
-        known.ino === file.ino &&
-        file.mtimeNs + RACY_WINDOW_NS < known.hashedAtNs
-      ) {
+      if (isStatCacheHit(known, file)) {
         files.set(file.rel, known);
-        if (timing) changeDetectionMs += performance.now() - mark;
+        watch.lap('changeDetection');
         continue;
       }
-      if (timing) changeDetectionMs += performance.now() - mark;
+      watch.lap('changeDetection');
 
       // Reading the content is not attributed to any phase.
       const hashedAtNs = options.nowNs();
@@ -276,13 +328,9 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
       }
       hashed += 1;
       // scanRedact: Redaction of the content.
-      if (timing) mark = performance.now();
+      watch.start();
       const { bytes, hits } = redactContent(raw);
-      if (timing) {
-        const now = performance.now();
-        scanRedactMs += now - mark;
-        mark = now;
-      }
+      watch.lap('scanRedact');
       if (bytes === null) {
         // Absent from this checkpoint's tree (and so deleted from the parent's, if it was there), reported once.
         skipped.push({ path: file.rel, size: file.size, reason: 'secret_detected' });
@@ -291,39 +339,25 @@ export async function buildSnapshot(options: SnapshotOptions): Promise<Snapshot>
       if (hits > 0) redactedFiles += 1;
       // hash: the git blob id of the sanitized content.
       const oid = gitBlobId(bytes, options.objectFormat);
-      if (timing) {
-        const now = performance.now();
-        hashMs += now - mark;
-        mark = now;
-      }
+      watch.lap('hash');
       files.set(file.rel, { mode: file.mode, oid, size: file.size, mtimeNs: file.mtimeNs, ino: file.ino, hashedAtNs });
 
       // changeDetection: whether the sanitized blob differs from the parent tree. blobWrite: staging it when it does.
       const parent = parentTree.get(file.rel);
-      if (parentCommit === null || parent === undefined || parent.mode !== file.mode || parent.oid !== oid) {
-        if (timing) {
-          const now = performance.now();
-          changeDetectionMs += now - mark;
-          mark = now;
-        }
+      const changed = parentCommit === null || parent === undefined || parent.mode !== file.mode || parent.oid !== oid;
+      watch.lap('changeDetection');
+      if (changed) {
         await stageEntry(stagingDir, file.rel, file.mode, bytes);
         written.push(file.rel);
-        if (timing) blobWriteMs += performance.now() - mark;
-      } else if (timing) {
-        changeDetectionMs += performance.now() - mark;
+        watch.lap('blobWrite');
       }
     }
 
     // changeDetection: the parent tree's paths that are gone.
-    if (timing) mark = performance.now();
+    watch.start();
     const changes = parentCommit === null ? undefined : { written, deleted: [...parentTree.keys()].filter((p) => !files.has(p)) };
-    if (timer !== undefined) {
-      changeDetectionMs += performance.now() - mark;
-      reportPhase(timer, 'changeDetection', changeDetectionMs);
-      reportPhase(timer, 'scanRedact', scanRedactMs);
-      reportPhase(timer, 'hash', hashMs);
-      reportPhase(timer, 'blobWrite', blobWriteMs);
-    }
+    watch.lap('changeDetection');
+    watch.flush();
     return { stagingDir, changes, files, skipped, hashed, redactedFiles, cleanup };
   } catch (err) {
     await cleanup();
