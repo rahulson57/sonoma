@@ -7,7 +7,10 @@
  * schema change, not something an adapter may do on its own.
  */
 
-/** The 19 v1 event types, in SPEC-004 order. */
+/**
+ * The 23 v1 event types, in SPEC-004 order. SPEC-015 amendment 1 added `state.declared`, `agent.suspended`,
+ * `adapter.error` and `adapter.unknown_hook` to the original 19.
+ */
 export const LEDGER_EVENT_TYPES = [
   'run.created',
   'agent.started',
@@ -22,12 +25,16 @@ export const LEDGER_EVENT_TYPES = [
   'side_effect.requested',
   'side_effect.committed',
   'checkpoint.created',
+  'state.declared',
   'agent.interrupted',
+  'agent.suspended',
   'agent.resumed',
   'agent.forked',
   'agent.rolled_back',
   'distill.completed',
   'export.unsafe',
+  'adapter.error',
+  'adapter.unknown_hook',
 ] as const;
 
 export type LedgerEventType = (typeof LEDGER_EVENT_TYPES)[number];

@@ -42,7 +42,7 @@ describe('versioned projections', () => {
       const changed = await fx.append('workspace.changed', { paths: ['src/app.ts'] });
       const c2 = await fx.checkpoint(c1, { 'src/app.ts': 'export const logging = true;\n' }, 'logging-added');
 
-      const haiku = await fx.provider('claude-haiku-4-5-20251001', [
+      const haiku = await fx.provider('claude-haiku-4-5', [
         JSON.stringify({
           claims: [
             {
@@ -79,8 +79,9 @@ describe('versioned projections', () => {
       const second = await distill(request, fx.deps(sonnet, first.budget));
 
       expect(first.projection.id).not.toBe(second.projection.id);
-      expect(first.projection.distiller.model).toBe('claude-haiku-4-5-20251001');
-      expect(second.projection.distiller.model).toBe('claude-sonnet-5');
+      expect(first.projection.source).toBe('distilled');
+      expect(first.projection.distiller?.model).toBe('claude-haiku-4-5');
+      expect(second.projection.distiller?.model).toBe('claude-sonnet-5');
       expect(first.rejectedClaims).toBe(1);
       expect(second.rejectedClaims).toBe(0);
       expect(second.budget.spentUsd).toBeCloseTo(2 * RECORDED_USAGE.costUsd, 10);
@@ -91,6 +92,11 @@ describe('versioned projections', () => {
         first.projection.id,
         second.projection.id,
       ]);
+      // Both versions are in the durable index too, not only in this store object. The index orders by createdAt
+      // then id; both distillations share the fixture clock's createdAt, so compare them in id order.
+      const byId = (a: { id: string }, b: { id: string }): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+      const durable = await fx.backend.listProjections({ checkpointId: c2.checkpoint_id, runId: fx.runId });
+      expect([...durable].sort(byId)).toEqual([first.projection, second.projection].sort(byId));
 
       const after = await snapshot(fx, c2);
       expect(after).toEqual(before);

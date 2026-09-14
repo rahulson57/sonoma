@@ -66,7 +66,7 @@ describe('checkpoint crash atomicity', () => {
         expect((await restarted.backend.listCheckpoints(run.run_id)).map((cp) => cp.checkpoint_id)).toEqual(['c_1']);
         await expect(restarted.backend.getCheckpoint({ run_id: run.run_id, checkpoint_id: 'c_2' })).rejects.toMatchObject({ code: 'ERR_NOT_FOUND' });
 
-        expect(await restarted.backend.reindex()).toEqual({ runs: 1, checkpoints: 1, events: 2 });
+        expect(await restarted.backend.reindex()).toEqual({ runs: 1, checkpoints: 1, events: 2, projections: 0, claims: 0 });
         expect(await expectConsistent(restarted.backend, repo.dir, run.run_id)).toEqual([c1]);
 
         // The run continues: the next checkpoint takes c_2 and replaces the orphan ref.
@@ -105,7 +105,7 @@ describe('checkpoint crash atomicity', () => {
         expect((await restarted.backend.listCheckpoints(run.run_id)).map((cp) => cp.checkpoint_id)).toEqual(['c_1']);
         expect(await restarted.backend.getEvents(run.run_id, { fromSeq: 1, toSeq: 100 })).toHaveLength(1);
 
-        expect(await restarted.backend.reindex()).toEqual({ runs: 1, checkpoints: 2, events: 2 });
+        expect(await restarted.backend.reindex()).toEqual({ runs: 1, checkpoints: 2, events: 2, projections: 0, claims: 0 });
         const listed = await expectConsistent(restarted.backend, repo.dir, run.run_id);
         expect(listed.map((cp) => cp.checkpoint_id)).toEqual(['c_1', 'c_2']);
         expect(listed[0]).toEqual(c1);

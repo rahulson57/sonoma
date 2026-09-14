@@ -168,7 +168,8 @@ describe('ExecutionLedger append contract', () => {
 
   it('rejects an event type outside the enum without advancing the head', async () => {
     const ledger = newLedger(RUN);
-    const attempt = ledger.append({ ...base, type: 'state.declared' as never });
+    // `state.declared` joined the enum in SPEC-015; this one is still outside it.
+    const attempt = ledger.append({ ...base, type: 'state.undeclared' as never });
     await expect(attempt).rejects.toBeInstanceOf(LedgerError);
     await expect(attempt).rejects.toMatchObject({ code: 'ERR_UNKNOWN_EVENT_TYPE' });
     expect(ledger.head).toEqual(GENESIS_HEAD);

@@ -26,12 +26,13 @@ describe('SemanticProjection records its distiller and inputs', () => {
 
     expect(SCHEMA_FILES.semanticProjection).toBe('semantic-projection.schema.json');
     const schema = JSON.parse(readFileSync(path.join(schemaDir(), SCHEMA_FILES.semanticProjection), 'utf8')) as { required: string[] };
-    expect(schema.required).toEqual(expect.arrayContaining(['distiller', 'input']));
+    expect(schema.required).toEqual(expect.arrayContaining(['source', 'distiller', 'input']));
     schemaValid(projection);
     expect(projection).toEqual({
       id: 'proj_1',
       checkpointId: 'c_2',
-      distiller: { provider: 'anthropic', model: 'claude-haiku-4-5-20251001', promptVersion: PROMPT_VERSION },
+      source: 'distilled',
+      distiller: { provider: 'anthropic', model: 'claude-haiku-4-5', promptVersion: PROMPT_VERSION },
       input: { stateHash: run.request.stateHash, ledgerRange: [10, 30], workspaceCommit: COMMIT },
       claims: [{ ...claim, origin: 'distilled' }],
       usage: USAGE,
@@ -85,7 +86,7 @@ describe('BlobProjectionStore', () => {
     const { projection } = await distill(run.request, depsFor(run, spyProvider(reply([]))));
     const store = new BlobProjectionStore(new MemoryBlobs());
 
-    await expect(store.put({ ...projection, distiller: { ...projection.distiller, model: '' } })).rejects.toMatchObject({
+    await expect(store.put({ ...projection, distiller: { ...projection.distiller!, model: '' } })).rejects.toMatchObject({
       code: 'DISTILL_INVALID_PROJECTION',
     });
     await store.put(projection);

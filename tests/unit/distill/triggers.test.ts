@@ -1,4 +1,7 @@
 /** SPEC-007 "Triggers" / DEC-006: only labeled checkpoints, handoff and `ckpt distill` reach the distiller. */
+import { readdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_MODEL,
@@ -64,6 +67,18 @@ describe('distill triggers', () => {
 
   it('names the SPEC-007 default provider and model', () => {
     expect(DEFAULT_PROVIDER).toBe('anthropic');
-    expect(DEFAULT_MODEL).toBe('claude-haiku-4-5-20251001');
+    expect(DEFAULT_MODEL).toBe('claude-haiku-4-5');
+  });
+
+  it('no file under src/distill/** contains the stale date-suffixed model id', async () => {
+    // Assembled so this test file does not itself contain the stale id.
+    const stale = ['claude-haiku-4-5', '20251001'].join('-');
+    const root = fileURLToPath(new URL('../../../src/distill/', import.meta.url));
+    const files = (await readdir(root, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile());
+    expect(files.length).toBeGreaterThan(0);
+    for (const entry of files) {
+      const file = path.join(entry.parentPath, entry.name);
+      expect((await readFile(file, 'utf8')).includes(stale), `${file} contains ${stale}`).toBe(false);
+    }
   });
 });

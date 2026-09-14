@@ -1,11 +1,15 @@
 /**
- * Projection persistence. SPEC-005's StorageBackend has no projection API, so a projection is stored as
- * an immutable CAS blob (its canonical JSON) through putBlob/getBlob. That write touches no ledger event,
- * no git ref and no Agent State Object, so distilling never changes a checkpoint's state hash or ledger
- * head. Projections are never overwritten: re-distilling produces a new id.
+ * Projection persistence. A projection is stored as an immutable CAS blob holding its canonical JSON. That write
+ * touches no ledger event, no git ref and no Agent State Object, so distilling never changes a checkpoint's state
+ * hash or ledger head. Projections are never overwritten: re-distilling produces a new id.
  *
- * The id → blob index is held by this object, in process. A durable projection index (index table +
- * reindex) would need a SPEC-005 change and is not built here.
+ * Durable home (SPEC-005 / SPEC-015 amendment 4): when the blobs object is a StorageBackend (it has
+ * `putProjection`), the store writes through it. The projection then goes to CAS AND into the durable
+ * projection-and-claim index, listable with `listProjections` / `listClaims` from any process and rebuilt by
+ * `reindex()`. A plain blob sink (e.g. an in-memory test CAS) gets `putBlob`, with the same bytes and address.
+ *
+ * `get` and `listForCheckpoint` answer from the projections this object stored. Cross-process reads go through
+ * the StorageBackend listing methods, because checkpoint ids repeat across runs and this object is not bound to one.
  */
 import type { Readable } from 'node:stream';
 import { buffer } from 'node:stream/consumers';
@@ -23,10 +27,12 @@ export interface ProjectionStore {
   listForCheckpoint(checkpointId: string): Promise<SemanticProjection[]>;
 }
 
-/** The blob half of StorageBackend. LocalBackend satisfies it. */
+/** The blob half of StorageBackend, plus its durable projection write when present. LocalBackend satisfies it. */
 export interface ProjectionBlobs {
   putBlob(data: Uint8Array): Promise<BlobRef>;
   getBlob(ref: BlobRef): Promise<Readable | Uint8Array>;
+  /** StorageBackend.putProjection: CAS write, then index rows. Used instead of putBlob when present. */
+  putProjection?(projection: SemanticProjection): Promise<BlobRef>;
 }
 
 interface Entry {
@@ -54,7 +60,10 @@ export class BlobProjectionStore implements ProjectionStore {
       throw new DistillError('DISTILL_PROJECTION_EXISTS', `projection ${id} is already stored; projections are never overwritten`);
     }
     // Claim the id before the first await, so a concurrent put of the same id is refused too.
-    const ref = this.#blobs.putBlob(Buffer.from(canonicalJSON(projection), 'utf8'));
+    const ref =
+      this.#blobs.putProjection !== undefined
+        ? this.#blobs.putProjection(projection)
+        : this.#blobs.putBlob(Buffer.from(canonicalJSON(projection), 'utf8'));
     this.#entries.set(id, { checkpointId, ref });
     try {
       await ref;

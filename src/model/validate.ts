@@ -83,10 +83,20 @@ export function validateSemanticClaim(value: unknown): Result<SemanticClaim> {
   return checked<SemanticClaim>('semanticClaim', value);
 }
 
+/**
+ * SPEC-004 v3 / SPEC-015 amendment 3: a `distilled` projection must name its distiller and record its usage.
+ * Only a `declared` projection may leave either null.
+ */
 export function validateSemanticProjection(value: unknown): Result<SemanticProjection> {
   return checked<SemanticProjection>('semanticProjection', value, (projection) => {
+    const errors: string[] = [];
     const [from, to] = projection.input.ledgerRange;
-    return from <= to ? [] : [`/input/ledgerRange: start ${from} is after end ${to}`];
+    if (from > to) errors.push(`/input/ledgerRange: start ${from} is after end ${to}`);
+    if (projection.source === 'distilled') {
+      if (projection.distiller === null) errors.push("/distiller: a projection with source 'distilled' needs a distiller block");
+      if (projection.usage === null) errors.push("/usage: a projection with source 'distilled' needs its usage");
+    }
+    return errors;
   });
 }
 

@@ -6,8 +6,8 @@ import {
   isLedgerEventType,
 } from '../../../src/ledger/event-types.js';
 
-// Transcribed from SPEC-004 "Event types (v1)" — the test's own copy, so an edit to the enum
-// that is not also a spec change fails here.
+// Transcribed from SPEC-004 "Event types (v1) — exactly 23" (amended by SPEC-015) — the test's own copy, so an
+// edit to the enum that is not also a spec change fails here.
 const SPEC_004_V1_TYPES = [
   'run.created',
   'agent.started',
@@ -22,19 +22,30 @@ const SPEC_004_V1_TYPES = [
   'side_effect.requested',
   'side_effect.committed',
   'checkpoint.created',
+  'state.declared',
   'agent.interrupted',
+  'agent.suspended',
   'agent.resumed',
   'agent.forked',
   'agent.rolled_back',
   'distill.completed',
   'export.unsafe',
+  'adapter.error',
+  'adapter.unknown_hook',
 ];
 
-describe('ledger event-type enum (SPEC-004 v1)', () => {
-  it('contains exactly the 19 v1 types listed in the spec', () => {
-    expect(LEDGER_EVENT_TYPES).toHaveLength(19);
-    expect(new Set(LEDGER_EVENT_TYPES).size).toBe(19);
-    expect([...LEDGER_EVENT_TYPES].sort()).toEqual([...SPEC_004_V1_TYPES].sort());
+describe('ledger event-type enum (SPEC-004 v1, SPEC-015 amendment 1)', () => {
+  it('contains exactly the 23 v1 types listed in the spec, in spec order', () => {
+    expect(LEDGER_EVENT_TYPES).toHaveLength(23);
+    expect(new Set(LEDGER_EVENT_TYPES).size).toBe(23);
+    expect([...LEDGER_EVENT_TYPES]).toEqual(SPEC_004_V1_TYPES);
+  });
+
+  it('includes state.declared, agent.suspended, adapter.error and adapter.unknown_hook', () => {
+    for (const type of ['state.declared', 'agent.suspended', 'adapter.error', 'adapter.unknown_hook']) {
+      expect(LEDGER_EVENT_TYPES).toContain(type);
+      expect(isLedgerEventType(type)).toBe(true);
+    }
   });
 
   it('includes agent.rolled_back', () => {
@@ -47,7 +58,7 @@ describe('ledger event-type enum (SPEC-004 v1)', () => {
   });
 
   it('rejects anything outside the enum', () => {
-    for (const bad of ['state.declared', 'agent.suspended', 'tool.Completed', 'tool.completed ', '', 'run', 7, null, undefined, {}]) {
+    for (const bad of ['state.Declared', 'agent.paused', 'adapter.warning', 'tool.Completed', 'tool.completed ', '', 'run', 7, null, undefined, {}]) {
       expect(isLedgerEventType(bad)).toBe(false);
     }
   });

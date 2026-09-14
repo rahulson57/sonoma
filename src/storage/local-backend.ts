@@ -21,12 +21,19 @@
  * the chain always continues from the durable head. If a write fails midway, the writer is dropped
  * and its lock released, and the next write recovers from disk again.
  *
+ * Projections and claims (SPEC-005 "Durable projection-and-claim index", SPEC-015 amendment 4): putProjection
+ * writes the projection's canonical JSON to CAS (durable) and only then indexes it and its claims in one
+ * transaction. CAS is the source of truth. reindex() rebuilds the rows by scanning CAS for blobs that are
+ * valid projections of a durable checkpoint, matched by checkpoint id, state hash and workspace commit.
+ * Listing reads the projections back from CAS, so a fresh process sees everything a previous one wrote.
+ *
  * Not here: sanitization (the caller's, SPEC-003), checkpoint lifecycle policy (Checkpoint Engine),
  * and the ledger hash chain (S03's ExecutionLedger seals every event).
  */
 import { readdir, readFile } from 'node:fs/promises';
 import type { Readable } from 'node:stream';
 import { canonicalJSON } from '../ledger/canonical-json.js';
+import { sha256Hex } from '../ledger/hash.js';
 import { ExecutionLedger, GENESIS_HEAD, type LedgerClock, type LedgerHead } from '../ledger/ledger.js';
 import { verifyChain } from '../ledger/verify-chain.js';
 import {
@@ -38,15 +45,17 @@ import {
   type LedgerEvent,
   type LedgerEventDraft,
   type Run,
+  type SemanticClaim,
+  type SemanticProjection,
 } from '../model/types.js';
-import { validateAgentState, validateCheckpoint } from '../model/validate.js';
+import { validateAgentState, validateCheckpoint, validateSemanticProjection } from '../model/validate.js';
 import { BlobStore } from './cas.js';
 import { ChangeDetector, type ChangeDetectionFs } from './change-detection.js';
-import { StorageError } from './errors.js';
+import { StorageError, isStorageError } from './errors.js';
 import { ensureDir, errnoCode, fsyncDir, writeExclusive } from './fs-util.js';
 import { GitRepo, checkWorkspaceChanges } from './git.js';
 import { cryptoRandom, ulid, type RandomSource } from './ids.js';
-import { IndexDb } from './index-db.js';
+import { IndexDb, type IndexedProjection, type ProjectionIndexEntry } from './index-db.js';
 import {
   CHECKPOINT_ID_PATTERN,
   RUN_ID_PATTERN,
@@ -62,7 +71,38 @@ import {
 } from './layout.js';
 import { appendEventLine, readEventLog, truncateEventLog } from './ledger-log.js';
 import { RunLock } from './lock.js';
-import type { CheckpointRef, NewCheckpoint, NewLedgerEvent, NewRun, StorageBackend } from './types.js';
+import type { CheckpointRef, NewCheckpoint, NewLedgerEvent, NewRun, ProjectionQuery, ReindexCounts, StorageBackend } from './types.js';
+
+/** canonicalJSON sorts members, and `checkpointId` sorts first in a SemanticProjection, so its blob starts with this. */
+const PROJECTION_BLOB_PREFIX = Buffer.from('{"checkpointId":', 'utf8');
+
+function stateKey(checkpointId: string, stateHash: string): string {
+  return `${checkpointId}\u0000${stateHash}`;
+}
+
+/** A valid SemanticProjection parsed from blob bytes, or undefined when the bytes are not one. */
+function parseProjection(bytes: Uint8Array): SemanticProjection | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(bytes).toString('utf8'));
+  } catch {
+    return undefined;
+  }
+  const valid = validateSemanticProjection(value);
+  return valid.ok ? valid.value : undefined;
+}
+
+function projectionEntry(projection: SemanticProjection, checkpoint: Checkpoint, ref: BlobRef): ProjectionIndexEntry {
+  return {
+    projection_id: projection.id,
+    run_id: checkpoint.run_id,
+    checkpoint_id: checkpoint.checkpoint_id,
+    source: projection.source,
+    created_at: projection.createdAt,
+    ref: { sha256: ref.sha256, size: ref.size },
+    claims: projection.claims.map((claim) => ({ field: claim.field, origin: claim.origin })),
+  };
+}
 
 /** Crash-injection seams for tests. A throwing hook simulates the process dying at that point. */
 export interface StorageFaults {
@@ -216,6 +256,12 @@ export class LocalBackend implements StorageBackend {
       this.#db.insertRun(run);
       return run;
     });
+  }
+
+  /** Every run, forks included, by created_at then run_id (SPEC-015 amendment 5). */
+  async listRuns(): Promise<Run[]> {
+    this.#assertOpen();
+    return this.#db.listRuns();
   }
 
   async appendEvent(runId: string, event: NewLedgerEvent): Promise<LedgerEvent> {
@@ -394,6 +440,48 @@ export class LocalBackend implements StorageBackend {
     return valid.value;
   }
 
+  async putProjection(projection: SemanticProjection): Promise<BlobRef> {
+    const valid = validateSemanticProjection(projection);
+    if (!valid.ok) throw invalid(`invalid projection: ${valid.errors.join('; ')}`);
+    const bytes = Buffer.from(canonicalJSON(projection), 'utf8');
+    const sha256 = sha256Hex(bytes);
+
+    return this.#exclusive(async () => {
+      const { checkpointId, input } = projection;
+      const checkpoint = this.#db.findCheckpointByState(checkpointId, input.stateHash);
+      if (checkpoint === undefined) {
+        throw new StorageError('ERR_NOT_FOUND', `no checkpoint ${checkpointId} has state hash ${input.stateHash}`);
+      }
+      if (checkpoint.workspace_commit !== input.workspaceCommit) {
+        throw invalid(`projection ${projection.id} names workspace commit ${input.workspaceCommit}, but ${checkpoint.run_id}/${checkpointId} is ${checkpoint.workspace_commit}`);
+      }
+      const existing = this.#db.getProjectionRef(projection.id);
+      if (existing !== undefined) {
+        if (existing.sha256 === sha256) return existing;
+        throw invalid(`projection ${projection.id} is already stored with different content; projections are never overwritten`);
+      }
+      // CAS first (durable), then the index rows, in one transaction.
+      const ref = await this.#blobs.put(bytes);
+      this.#db.transaction(() => {
+        this.#db.insertBlob(ref);
+        this.#db.insertProjection(projectionEntry(projection, checkpoint, ref));
+      });
+      return ref;
+    });
+  }
+
+  async listProjections(query: ProjectionQuery): Promise<SemanticProjection[]> {
+    this.#assertOpen();
+    const indexed = this.#projectionsFor(query);
+    const out: SemanticProjection[] = [];
+    for (const entry of indexed) out.push(await this.#readProjection(entry));
+    return out;
+  }
+
+  async listClaims(query: ProjectionQuery): Promise<SemanticClaim[]> {
+    return (await this.listProjections(query)).flatMap((projection) => projection.claims);
+  }
+
   /**
    * Storage half of a fork: a new run whose lineage points at `id`. Emitting `agent.forked` and
    * creating the fork's first checkpoint are the Checkpoint Engine's job.
@@ -405,8 +493,8 @@ export class LocalBackend implements StorageBackend {
     return this.createRun({ agent: source.agent, parent_run_id: checkpoint.run_id, forked_from_checkpoint: checkpoint.checkpoint_id });
   }
 
-  /** Rebuild checkpoint.db from runs/, CAS and refs. Takes every run's lock while it reads. */
-  async reindex(): Promise<{ runs: number; checkpoints: number; events: number }> {
+  /** Rebuild checkpoint.db from runs/, CAS and refs, projections and claims included. Takes every run's lock while it reads. */
+  async reindex(): Promise<ReindexCounts> {
     return this.#exclusive(async () => {
       const taken: RunLock[] = [];
       try {
@@ -421,6 +509,7 @@ export class LocalBackend implements StorageBackend {
           loaded.push(await this.#loadDurableRun(run, paths));
         }
         const blobs = await this.#blobs.list();
+        const projections = await this.#durableProjections(loaded, blobs);
 
         this.#db.transaction(() => {
           this.#db.clearAll();
@@ -430,6 +519,7 @@ export class LocalBackend implements StorageBackend {
             for (const checkpoint of durable.checkpoints) this.#db.insertCheckpoint(checkpoint);
           }
           for (const blob of blobs) this.#db.insertBlob(blob);
+          for (const entry of projections) this.#db.insertProjection(entry);
         });
 
         for (const durable of loaded) {
@@ -443,6 +533,8 @@ export class LocalBackend implements StorageBackend {
           runs: loaded.length,
           checkpoints: loaded.reduce((sum, durable) => sum + durable.checkpoints.length, 0),
           events: loaded.reduce((sum, durable) => sum + durable.events.length, 0),
+          projections: projections.length,
+          claims: projections.reduce((sum, entry) => sum + entry.claims.length, 0),
         };
       } finally {
         for (const lock of taken) await lock.release();
@@ -528,6 +620,104 @@ export class LocalBackend implements StorageBackend {
       await lock.release();
       throw err;
     }
+  }
+
+  /** The indexed projections a query names, in listing order. */
+  #projectionsFor(query: ProjectionQuery): IndexedProjection[] {
+    if (!isRecord(query)) throw invalid('a projection query is {runId, checkpointId} or {runId, lineage: true}');
+    assertRunId(query.runId, 'runId');
+    if (query.lineage === true) {
+      return this.#lineageCheckpoints(query.runId).flatMap((checkpoint) => this.#db.listProjections(checkpoint.run_id, checkpoint.checkpoint_id));
+    }
+    if (query.lineage !== undefined) throw invalid('lineage is true, or absent for a single-checkpoint query');
+    const { runId, checkpointId } = query;
+    assertCheckpointId(checkpointId, 'checkpointId');
+    if (this.#db.getCheckpoint(runId, checkpointId) === undefined) {
+      throw new StorageError('ERR_NOT_FOUND', `checkpoint ${runId}/${checkpointId} does not exist`);
+    }
+    return this.#db.listProjections(runId, checkpointId);
+  }
+
+  /**
+   * A run's lineage, oldest first: for each fork parent (outermost first), the checkpoint the child was forked from
+   * and its parent_checkpoint_id ancestors; then every checkpoint of the run itself. Each segment is in checkpoint
+   * order.
+   */
+  #lineageCheckpoints(runId: string): Checkpoint[] {
+    const run = this.#db.getRun(runId);
+    if (run === undefined) throw new StorageError('ERR_NOT_FOUND', `run ${runId} does not exist`);
+    const segments: Checkpoint[][] = [this.#db.listCheckpoints(runId)];
+    const visited = new Set<string>([runId]);
+    let child: Run = run;
+    while (child.parent_run_id !== null && child.forked_from_checkpoint !== null && !visited.has(child.parent_run_id)) {
+      const parentRunId = child.parent_run_id;
+      visited.add(parentRunId);
+      const chain: Checkpoint[] = [];
+      const seen = new Set<string>();
+      let id: string | null = child.forked_from_checkpoint;
+      while (id !== null && !seen.has(id)) {
+        seen.add(id);
+        const checkpoint = this.#db.getCheckpoint(parentRunId, id);
+        if (checkpoint === undefined) break;
+        chain.push(checkpoint);
+        id = checkpoint.parent_checkpoint_id;
+      }
+      segments.unshift(chain.sort((a, b) => checkpointNumber(a.checkpoint_id) - checkpointNumber(b.checkpoint_id)));
+      const parent = this.#db.getRun(parentRunId);
+      if (parent === undefined) break;
+      child = parent;
+    }
+    return segments.flat();
+  }
+
+  async #readProjection(entry: IndexedProjection): Promise<SemanticProjection> {
+    let bytes: Buffer;
+    try {
+      bytes = await this.#blobs.read(entry.ref);
+    } catch (err) {
+      if (isStorageError(err, 'ERR_NOT_FOUND')) {
+        throw new StorageError('ERR_CORRUPT', `projection ${entry.projection_id} is indexed but blob ${entry.ref.sha256} is missing; run reindex`, { cause: err });
+      }
+      throw err;
+    }
+    const projection = parseProjection(bytes);
+    if (projection === undefined || projection.id !== entry.projection_id) {
+      throw new StorageError('ERR_CORRUPT', `blob ${entry.ref.sha256} indexed for projection ${entry.projection_id} does not hold it; run reindex`);
+    }
+    return projection;
+  }
+
+  /**
+   * The projection index rows reindex rebuilds from CAS: every blob that is a valid SemanticProjection of a durable
+   * checkpoint (same checkpoint id, state hash and workspace commit). Blobs are visited in address order, and the
+   * first blob for a projection id wins (putProjection never stores two different blobs under one id). A damaged
+   * candidate blob is skipped rather than failing the whole rebuild.
+   */
+  async #durableProjections(loaded: readonly DurableRun[], blobs: readonly BlobRef[]): Promise<ProjectionIndexEntry[]> {
+    const checkpoints = new Map<string, Checkpoint>();
+    for (const durable of loaded) {
+      for (const checkpoint of durable.checkpoints) checkpoints.set(stateKey(checkpoint.checkpoint_id, checkpoint.state_hash), checkpoint);
+    }
+    const entries: ProjectionIndexEntry[] = [];
+    const ids = new Set<string>();
+    for (const ref of blobs) {
+      if (ref.size < PROJECTION_BLOB_PREFIX.byteLength) continue;
+      if (!(await this.#blobs.readPrefix(ref, PROJECTION_BLOB_PREFIX.byteLength)).equals(PROJECTION_BLOB_PREFIX)) continue;
+      let bytes: Buffer;
+      try {
+        bytes = await this.#blobs.read(ref);
+      } catch (err) {
+        if (isStorageError(err, 'ERR_CORRUPT')) continue;
+        throw err;
+      }
+      const projection = parseProjection(bytes);
+      if (projection === undefined || ids.has(projection.id)) continue;
+      const checkpoint = checkpoints.get(stateKey(projection.checkpointId, projection.input.stateHash));
+      if (checkpoint === undefined || checkpoint.workspace_commit !== projection.input.workspaceCommit) continue;
+      ids.add(projection.id);
+      entries.push(projectionEntry(projection, checkpoint, ref));
+    }
+    return entries;
   }
 
   #seal(runId: string, writer: Writer, draft: NewLedgerEvent): Promise<LedgerEvent> {

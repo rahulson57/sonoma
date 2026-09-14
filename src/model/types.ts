@@ -75,6 +75,8 @@ export interface LedgerEventDraft {
   readonly run_id: string;
   readonly type: LedgerEventType;
   readonly actor: LedgerActor;
+  /** SPEC-004 `intent_id?`: correlates a request with its acknowledgement. Absent means null. */
+  readonly intent_id?: string | null | undefined;
   readonly payload: JsonPayload;
 }
 
@@ -88,6 +90,13 @@ export interface LedgerEvent {
   readonly ts: string;
   readonly type: LedgerEventType;
   readonly actor: LedgerActor;
+  /**
+   * SPEC-015 amendment 2: top-level and part of the hashed event, so a request still correlates with an
+   * acknowledgement whose payload was offloaded. Every event appended since the amendment carries it
+   * (string or null). An event sealed before the amendment has no such member at runtime, and it is never
+   * re-hashed to add one. Read it as `event.intent_id ?? null`.
+   */
+  readonly intent_id: string | null;
   /** Inline payload, or null when it was over the inline limit and stored as `payload_ref`. */
   readonly payload: JsonPayload | null;
   /** CAS blob holding the canonical JSON bytes of an over-limit payload; otherwise null. */
@@ -132,11 +141,33 @@ export interface SemanticClaim {
   readonly provenance: ClaimProvenance;
 }
 
-/** SPEC-007 SemanticProjection (camelCase per SPEC-007). */
+/** SPEC-015 amendment 3: who produced a projection. */
+export const PROJECTION_SOURCES = ['distilled', 'declared'] as const;
+
+export type ProjectionSource = (typeof PROJECTION_SOURCES)[number];
+
+export interface ProjectionDistiller {
+  readonly provider: string;
+  readonly model: string;
+  readonly promptVersion: string;
+}
+
+export interface ProjectionUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly costUsd: number;
+}
+
+/**
+ * SPEC-007 SemanticProjection (camelCase per SPEC-007), with SPEC-015 amendment 3 applied. `source: 'distilled'`
+ * requires non-null `distiller` and `usage`. `source: 'declared'` (an SDK or human declaration) may leave both
+ * null, so it never needs a faked distiller block.
+ */
 export interface SemanticProjection {
   readonly id: string;
   readonly checkpointId: string;
-  readonly distiller: { readonly provider: string; readonly model: string; readonly promptVersion: string };
+  readonly source: ProjectionSource;
+  readonly distiller: ProjectionDistiller | null;
   readonly input: {
     readonly stateHash: string;
     /** [previous cursor (exclusive), this cursor (inclusive)] */
@@ -144,7 +175,7 @@ export interface SemanticProjection {
     readonly workspaceCommit: string;
   };
   readonly claims: readonly SemanticClaim[];
-  readonly usage: { readonly inputTokens: number; readonly outputTokens: number; readonly costUsd: number };
+  readonly usage: ProjectionUsage | null;
   readonly createdAt: string;
 }
 
@@ -180,7 +211,7 @@ export type IntentStatus = (typeof INTENT_STATUSES)[number];
 /** One requested action and what the ledger acknowledges about it (SPEC-004 resume rule). */
 export interface PendingIntent {
   readonly kind: IntentKind;
-  /** tool_call_id / side_effect_id from the request payload; null when the request carries none. */
+  /** The request's top-level intent_id, else tool_call_id / side_effect_id from its payload; null when it has none. */
   readonly intent_id: string | null;
   readonly request_event_id: string;
   readonly status: IntentStatus;
