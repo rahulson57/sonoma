@@ -1,0 +1,10 @@
+{
+  "provider": "anthropic-recorded",
+  "model": "claude-haiku-4-5",
+  "responses": [
+    {
+      "text": "{\"claims\":[{\"field\":\"goal\",\"value\":\"Ship the ckpt CLI\",\"provenance\":{\"event_ids\":[],\"artifact_refs\":[],\"workspace_paths\":[],\"checkpoint_ids\":[\"c_1\"]}}]}",
+      "usage": { "inputTokens": 150000, "outputTokens": 30000, "costUsd": 0.3 }
+    }
+  ]
+}
