@@ -138,7 +138,7 @@ describe('checkpoint() with declaredState', () => {
     }
   });
 
-  it('rejects with the storage error when the projection write fails, emits no distill request, and leaves the checkpoint without claims (the documented window)', async () => {
+  it('NOT ATOMIC: the projection is written after createCheckpoint, so a failed write rejects checkpoint() with the storage error, emits no distill request, and leaves the checkpoint without claims, as a crash between the two writes would', async () => {
     const request = vi.fn();
     const fx = await engineFixture({ files: { 'a.txt': 'a\n' }, engine: { distill: { request } } });
     try {

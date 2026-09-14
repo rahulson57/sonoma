@@ -66,7 +66,7 @@ describe('save()', () => {
     }
   });
 
-  it('rejects, returning no CheckpointRef, when the Engine cannot store the declared claims', async () => {
+  it('NOT ATOMIC: claims are written after createCheckpoint, so a failed claims write rejects save() with no CheckpointRef and leaves that checkpoint without claims, as a crash between the two writes would', async () => {
     const fx = await engineFixture({ files: { 'README.md': '# app\n' } });
     try {
       const run = await fx.engine.startRun({ agent: 'sdk' });
@@ -75,6 +75,8 @@ describe('save()', () => {
       vi.spyOn(fx.backend, 'putProjection').mockRejectedValueOnce(failure);
 
       await expect(ckpt.save({ goal: 'g' })).rejects.toBe(failure);
+      // The checkpoint was already durable when the claims write failed: it stays, with no declared claims.
+      expect(await fx.backend.listClaims({ runId: run.run_id, checkpointId: 'c_1' })).toEqual([]);
       // The next save still works and lands on a new checkpoint with its claims.
       const ref = await ckpt.save({ goal: 'g2' });
       expect(ref.checkpointId).toBe('c_2');

@@ -7,6 +7,15 @@
  * 4. engine.checkpoint(runId, {label, declaredState}). The Engine sanitizes the claims, creates a NEW checkpoint and
  *    stores them as its declared projection. Earlier checkpoints are never touched.
  *
+ * SAVE IS NOT ATOMIC. The Engine writes the declared claims AFTER storage's createCheckpoint has already made the
+ * checkpoint durable; these are two separate writes.
+ * - If the claims write fails, save() rejects with that error and returns no CheckpointRef. The checkpoint itself
+ *   remains, without declared claims.
+ * - If the process crashes between the two writes, the checkpoint exists WITHOUT its declared claims, and reindex()
+ *   cannot recreate them. The sanitized `state.declared` ledger event still records the declaration; it is the
+ *   recovery path, and nothing turns it back into claims automatically.
+ * Storage-level atomicity belongs to S14 and is out of this module's scope (DEC-043).
+ *
  * The Engine instance is injected, and this module imports only its types, so the SDK carries no storage, git or
  * redaction code. No LLM or Distiller is called; a label only makes the Engine emit its own fire-and-forget request.
  *
