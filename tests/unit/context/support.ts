@@ -46,7 +46,21 @@ export interface Draft {
   readonly event_id?: string;
 }
 
-/** Seal drafts into a contiguous, hash-chained ledger starting at seq 1. */
+const TOOL_INTENT_TYPES: ReadonlySet<LedgerEventType> = new Set<LedgerEventType>(['tool.requested', 'tool.completed', 'tool.failed']);
+
+/**
+ * The top-level intent_id of a sealed fixture event (SPEC-015 amendment 2). A tool.requested / tool.completed /
+ * tool.failed event carries the payload tool_call_id the fixture already pairs it by. Every other event carries null,
+ * and so does an offloaded acknowledgement (payload null), which has no id to read. Correlation is therefore exactly
+ * what the payload fallback in derivePendingIntent already produced before the amendment.
+ */
+function intentIdOf(draft: Draft): string | null {
+  if (!TOOL_INTENT_TYPES.has(draft.type)) return null;
+  const id = draft.payload?.['tool_call_id'];
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/** Seal drafts into a contiguous, hash-chained ledger starting at seq 1. The hash covers intent_id, as src/ledger's does. */
 export function sealEvents(drafts: readonly Draft[], runId: string = RUN_ID): LedgerEvent[] {
   const events: LedgerEvent[] = [];
   let prev = GENESIS_PREV_HASH;
@@ -59,6 +73,7 @@ export function sealEvents(drafts: readonly Draft[], runId: string = RUN_ID): Le
       ts: new Date(START_MS + seq * 1000).toISOString(),
       type: draft.type,
       actor: draft.actor ?? 'runtime',
+      intent_id: intentIdOf(draft),
       payload: draft.payload,
       payload_ref: draft.payload_ref ?? null,
       prev_hash: prev,
@@ -186,6 +201,7 @@ export function projectionOf(checkpoint: Checkpoint, claims: readonly SemanticCl
   return {
     id,
     checkpointId: checkpoint.checkpoint_id,
+    source: 'distilled',
     distiller: { provider: 'fake', model: 'fake-model', promptVersion: 'distill-v1' },
     input: { stateHash: checkpoint.state_hash, ledgerRange: [0, checkpoint.ledger_seq], workspaceCommit: checkpoint.workspace_commit },
     claims: [...claims],
