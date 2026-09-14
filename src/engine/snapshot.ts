@@ -203,14 +203,11 @@ async function stageEntry(root: string, rel: string, mode: TreeMode, bytes: Buff
   if (mode === '100755') await chmod(target, 0o700);
 }
 
-/** The caller's observe-only phase timer: `SnapshotOptions.phaseTimer` when it is set. */
-type PhaseTimer = NonNullable<SnapshotOptions['phaseTimer']>;
-
 /**
  * Hand one phase's accumulated time to the caller's timer. The timer only observes: if `add()` throws (or is not a
  * function), the error is caught and ignored HERE, so the snapshot is exactly what it would have been without a timer.
  */
-function reportPhase(timer: PhaseTimer, phase: CheckpointPhase, ms: number): void {
+function reportPhase(timer: { add(phase: CheckpointPhase, ms: number): void }, phase: CheckpointPhase, ms: number): void {
   try {
     timer.add(phase, ms);
   } catch {
@@ -240,11 +237,11 @@ const doNothing = (): void => undefined;
 const NO_STOPWATCH: PhaseStopwatch = { start: doNothing, lap: doNothing, flush: doNothing };
 
 class TimedStopwatch implements PhaseStopwatch {
-  readonly #timer: PhaseTimer;
+  readonly #timer: NonNullable<SnapshotOptions['phaseTimer']>;
   readonly #totals: Record<SnapshotPhase, number> = { changeDetection: 0, scanRedact: 0, hash: 0, blobWrite: 0 };
   #mark = 0;
 
-  constructor(timer: PhaseTimer) {
+  constructor(timer: NonNullable<SnapshotOptions['phaseTimer']>) {
     this.#timer = timer;
   }
 
