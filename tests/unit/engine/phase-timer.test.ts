@@ -171,6 +171,14 @@ describe('phaseTimer: SPEC-002 per-phase checkpoint timings on the real engine a
 
   it('(b) the reported ms sum to no more than the wall time of the checkpoint() call', () => {
     const sum = rec.calls.reduce((total, call) => total + call.ms, 0);
+    // DEC-058(1): print the unattributed remainder (wall time minus the phase sum), so the gap left by work outside
+    // any phase (file reads, staging dir, fold, validation, writer, fault hooks) is visible rather than implied.
+    const byPhase = Object.fromEntries(
+      PHASES.map((phase) => [phase, rec.calls.filter((call) => call.phase === phase).reduce((total, call) => total + call.ms, 0)]),
+    );
+    console.info(
+      `[phase-timer] wallMs=${timed.wallMs.toFixed(3)} phaseSumMs=${sum.toFixed(3)} unattributedMs=${(timed.wallMs - sum).toFixed(3)} byPhase=${JSON.stringify(byPhase)}`,
+    );
     expect(sum).toBeGreaterThan(0);
     expect(sum).toBeLessThanOrEqual(timed.wallMs);
   });
