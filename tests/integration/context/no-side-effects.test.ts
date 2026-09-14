@@ -70,6 +70,7 @@ function projectionFor(checkpoint: Checkpoint, id: string, overrides: { stateHas
   return {
     id,
     checkpointId: checkpoint.checkpoint_id,
+    source: 'distilled',
     distiller: { provider: 'anthropic', model: 'claude-haiku-4-5-20251001', promptVersion: 'distill-v1' },
     input: { stateHash: overrides.stateHash ?? checkpoint.state_hash, ledgerRange: [0, checkpoint.ledger_seq], workspaceCommit: checkpoint.workspace_commit },
     claims: [
@@ -124,8 +125,19 @@ describe('context build has no side effects', () => {
 
       const store = new BlobProjectionStore(backend);
       await store.put(projectionFor(c1, 'proj_c1', { claimValue: 'Bump v to 2', eventId: cited.event_id }));
-      // Stored under c_2's id with other inputs (as another run's c_2 would be): not c_2's, so the walk goes on to c_1.
-      await store.put(projectionFor(c2, 'proj_other_run', { stateHash: c1.state_hash, claimValue: 'Belongs to another run', eventId: cited.event_id }));
+      // Stored under c_2's id with other inputs: another run's real c_2. Since SPEC-015 #4 the store indexes a projection
+      // against the checkpoint it names, so the decoy must name one that exists. It is not this run's c_2, so the walk
+      // goes on to c_1.
+      const other = await engine.startRun({ agent: 'claude-code' });
+      clock.tick(1000);
+      await engine.checkpoint(other.run_id);
+      clock.tick(1000);
+      const otherC2 = await engine.checkpoint(other.run_id);
+      expect(otherC2.checkpoint_id).toBe(c2.checkpoint_id);
+      expect(otherC2.state_hash).not.toBe(c2.state_hash);
+      const [otherCreated] = await backend.getEvents(other.run_id, { fromSeq: 1, toSeq: 1 });
+      if (otherCreated === undefined) throw new Error('the other run has no first event');
+      await store.put(projectionFor(otherC2, 'proj_other_run', { claimValue: 'Belongs to another run', eventId: otherCreated.event_id }));
 
       // A run forked from c_2, whose first checkpoint adds a file.
       const forked = await engine.fork({ runId, checkpointId: c2.checkpoint_id });
