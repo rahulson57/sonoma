@@ -1,9 +1,9 @@
 /**
  * SPEC-011 "Import" beyond the hash chain and content addresses: what a re-sealed ledger or a padded
  * bundle can fake. Nothing in a ledger is signed, so anyone holding a bundle can edit it and recompute the
- * chain. Import must still refuse a ref at a non-commit and a state blob of the wrong size, and must
- * format-check every git object before writing any. It writes only what the imported runs use, and a
- * failed import never deletes a shared CAS blob.
+ * chain. Import must still refuse a ref at a non-commit, a git object of the wrong type anywhere below a
+ * ref, and a state blob of the wrong size, and must format-check every git object before writing any. It
+ * writes only what the imported runs use, and a failed import never deletes a shared CAS blob.
  */
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -30,6 +30,17 @@ import {
   storeState,
   type Store,
 } from '../../unit/bundle/fixtures.js';
+
+const IDENTITY = 'Bundle Test <bundle-test@example.com> 1767225600 +0000';
+
+function commitObject(tree: string, parents: readonly string[] = []): Buffer {
+  const lines = [`tree ${tree}`, ...parents.map((parent) => `parent ${parent}`), `author ${IDENTITY}`, `committer ${IDENTITY}`, '', 'planted checkpoint', ''];
+  return encodeGitObject('commit', Buffer.from(lines.join('\n'), 'utf8'));
+}
+
+function treeObject(mode: string, name: string, sha: string): Buffer {
+  return encodeGitObject('tree', Buffer.concat([Buffer.from(`${mode} ${name}\0`, 'utf8'), Buffer.from(sha, 'hex')]));
+}
 
 describe('import verification of re-sealed and padded bundles', () => {
   let source: Store;
@@ -76,17 +87,16 @@ describe('import verification of re-sealed and padded bundles', () => {
     expect(before.runs).not.toContain(runId);
   }
 
-  it.each(['already in this repository', 'carried by the bundle'] as const)('a re-sealed checkpoint whose ref points at a blob %s is rejected before any write', async (where) => {
-    const entries = await readBundle(bundlePath);
-    const target =
-      where === 'already in this repository'
-        ? (await git(destination.repo.dir, ['rev-parse', `${own.workspace_commit}:own.txt`])).trim()
-        : gitObjectId([...entries].find(([name, bytes]) => name.startsWith('git/objects/') && bytes.toString('latin1').startsWith('blob '))![1]);
+  /**
+   * A copy of the bundle, with `objects` added as git objects, in which c_1 points at `target`. Its state
+   * blob, checkpoint record, ref and manifest all agree on `target`, and the chain is re-sealed, so only
+   * checks the chain cannot provide stand between it and the store.
+   */
+  async function repointedCopy(name: string, target: string, objects: readonly Buffer[] = []): Promise<string> {
     const first = checkpoints[0]!;
-
-    const variant = variantPath('ref-at-blob');
+    const variant = variantPath(name);
     await rewrittenCopy(bundlePath, variant, (edited) => {
-      // The checkpoint's state, record and ref all agree on the blob, and the chain is re-sealed.
+      for (const object of objects) edited.set(gitObjectEntry(gitObjectId(object)), object);
       const state = JSON.parse(edited.get(casEntry(first.state_blob.sha256))!.toString('utf8')) as Record<string, unknown>;
       const stateBytes = Buffer.from(canonicalJSON({ ...state, workspace_commit: target }), 'utf8');
       const stateRef: BlobRef = { sha256: sha256(stateBytes), size: stateBytes.byteLength };
@@ -107,8 +117,84 @@ describe('import verification of re-sealed and padded bundles', () => {
         gitRefs: manifest.gitRefs.map((gitRef) => (gitRef.ref === ref ? { ref, sha: target } : gitRef)),
       }));
     });
+    return variant;
+  }
 
-    await expectRejectedWithoutWrites(variant, 'ERR_INVALID_BUNDLE', /does not point at a commit/);
+  it.each(['already in this repository', 'carried by the bundle'] as const)('a re-sealed checkpoint whose ref points at a blob %s is rejected before any write', async (where) => {
+    const target =
+      where === 'already in this repository'
+        ? (await git(destination.repo.dir, ['rev-parse', `${own.workspace_commit}:own.txt`])).trim()
+        : gitObjectId([...(await readBundle(bundlePath))].find(([name, bytes]) => name.startsWith('git/objects/') && bytes.toString('latin1').startsWith('blob '))![1]);
+
+    await expectRejectedWithoutWrites(await repointedCopy('ref-at-blob', target), 'ERR_INVALID_BUNDLE', /does not point at a commit/);
+  });
+
+  describe('git object types below the ref', () => {
+    // Objects the bundle carries (c_1's workspace) and objects only the destination has (its own checkpoint).
+    const sourceObject = async (spec: string): Promise<string> => (await git(source.repo.dir, ['rev-parse', spec])).trim();
+    const destinationObject = async (spec: string): Promise<string> => (await git(destination.repo.dir, ['rev-parse', spec])).trim();
+
+    it('a re-sealed checkpoint at a planted commit whose types are right imports (control for the cases below)', async () => {
+      const tree = treeObject('40000', 'workspace', await sourceObject(`${checkpoints[0]!.workspace_commit}^{tree}`));
+      const commit = commitObject(gitObjectId(tree), [await destinationObject(own.workspace_commit)]);
+
+      expect(await destination.service.importBundle(await repointedCopy('well-typed', gitObjectId(commit), [tree, commit]))).toEqual({ runIds: [runId] });
+      expect((await destination.backend.listCheckpoints(runId)).map((c) => c.workspace_commit)).toEqual([gitObjectId(commit), checkpoints[1]!.workspace_commit]);
+      expect(await git(destination.repo.dir, ['fsck', '--no-dangling'])).toBe('');
+    });
+
+    const cases: ReadonlyArray<{
+      readonly name: string;
+      readonly objects: () => Promise<Buffer[]>;
+      readonly pattern: RegExp;
+    }> = [
+      {
+        name: "a commit whose tree is a blob carried by the bundle",
+        objects: async () => [commitObject(await sourceObject(`${checkpoints[0]!.workspace_commit}:README.md`))],
+        pattern: /as a tree, but it is a blob/,
+      },
+      {
+        name: 'a commit whose tree is a blob already in this repository',
+        objects: async () => [commitObject(await destinationObject(`${own.workspace_commit}:own.txt`))],
+        pattern: /as a tree, but it is a blob/,
+      },
+      {
+        name: 'a tree whose regular-file entry is a tree',
+        objects: async () => {
+          const tree = treeObject('100644', 'file.txt', await sourceObject(`${checkpoints[0]!.workspace_commit}^{tree}`));
+          return [tree, commitObject(gitObjectId(tree))];
+        },
+        pattern: /as a blob, but it is a tree/,
+      },
+      {
+        name: 'a tree whose directory entry is a blob',
+        objects: async () => {
+          const tree = treeObject('40000', 'src', await sourceObject(`${checkpoints[0]!.workspace_commit}:README.md`));
+          return [tree, commitObject(gitObjectId(tree))];
+        },
+        pattern: /as a tree, but it is a blob/,
+      },
+      {
+        name: 'a commit whose parent is a blob carried by the bundle',
+        objects: async () => [
+          commitObject(await sourceObject(`${checkpoints[0]!.workspace_commit}^{tree}`), [await sourceObject(`${checkpoints[0]!.workspace_commit}:README.md`)]),
+        ],
+        pattern: /as a commit, but it is a blob/,
+      },
+      {
+        name: 'a commit whose parent is a tree already in this repository',
+        objects: async () => [commitObject(await sourceObject(`${checkpoints[0]!.workspace_commit}^{tree}`), [await destinationObject(`${own.workspace_commit}^{tree}`)])],
+        pattern: /as a commit, but it is a tree/,
+      },
+    ];
+
+    it.each(cases)('$name is rejected before any write', async ({ objects, pattern }) => {
+      const planted = await objects();
+      const commit = planted.at(-1)!;
+      await expectRejectedWithoutWrites(await repointedCopy('wrong-type', gitObjectId(commit), planted), 'ERR_INVALID_BUNDLE', pattern);
+      const present = await (await BundleGit.open(destination.repo.dir)).inspect(planted.map((object) => gitObjectId(object)));
+      expect([...present].filter(([, info]) => info !== null)).toEqual([]);
+    });
   });
 
   it('a re-sealed checkpoint whose state blob size differs from the bundled blob is rejected before any write', async () => {

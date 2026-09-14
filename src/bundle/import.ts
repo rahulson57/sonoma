@@ -1,7 +1,8 @@
 /**
  * Import (SPEC-011 "Import"): verify the whole bundle, then write it into the store.
  *
- * Verification happens before the first byte is written, and covers:
+ * Verification happens before the first byte of store content is written (git's format check needs
+ * scratch copies of the objects under the store's tmp, which it removes again), and covers:
  * - the tar itself (checksums, regular files only, no unsafe names) and the bundle layout: any other
  *   entry, such as refs/heads/*, rejects the bundle;
  * - every CAS blob's sha256 against its address, and every git object's sha1 against its id plus git's own
@@ -12,6 +13,8 @@
  *   (bundled or already in this repository), and its state blob, matched by sha256 AND size, is a valid
  *   Agent State Object for it;
  * - completeness: every blob and git object the runs need is in the bundle or already in the store;
+ * - types: every git object a ref reaches has the type its referrer requires (a commit's tree is a tree,
+ *   its parents are commits, a tree entry is a tree or a blob by its mode);
  * - the destination: a run that exists with a different head is rejected, never overwritten. A run whose
  *   head is identical is already imported and is left alone.
  * Any mismatch aborts with nothing written.
@@ -43,7 +46,7 @@ import { CHECKPOINT_ID_PATTERN, RUN_ID_PATTERN, checkpointRefName, runPaths } fr
 import { RunLock } from '../storage/lock.js';
 import { BundleError } from './errors.js';
 import type { BundleContext } from './export.js';
-import { GIT_SHA, decodeGitObject, gitObjectId, referencedObjects, type GitObject, type GitObjectType } from './git.js';
+import { GIT_SHA, decodeGitObject, gitObjectId, referencedObjects, type GitObject, type GitObjectType, type ObjectReference } from './git.js';
 import { MANIFEST_ENTRY, parseEntryName, type BundleEntryKind } from './layout.js';
 import { checkpointsFromLedger, collectBlobRefs, isRecord, parseCanonicalJson, parseRunRecord, runRecordText, sha256Hex } from './records.js';
 import { BundleFormatError, readTarEntry, readTarIndex, type TarEntry } from './tar.js';
@@ -79,6 +82,16 @@ const CHECK_BATCH_OBJECTS = 4096;
 const invalid = (message: string): BundleError => new BundleError('ERR_INVALID_BUNDLE', message);
 const tampered = (message: string): BundleError => new BundleError('ERR_TAMPERED', message);
 const incomplete = (message: string): BundleError => new BundleError('ERR_INCOMPLETE_BUNDLE', message);
+
+/** A git object to visit while walking a run's refs: the type it must have, and what requires that type. */
+interface PendingReference extends ObjectReference {
+  readonly from: { readonly ref: string } | { readonly sha: string; readonly type: GitObjectType };
+}
+
+function wrongType(reference: PendingReference, actual: GitObjectType): BundleError {
+  if ('ref' in reference.from) return invalid(`ref ${reference.from.ref} does not point at a commit (${reference.sha} is a ${actual})`);
+  return invalid(`git ${reference.from.type} ${reference.from.sha} references ${reference.sha} as a ${reference.type}, but it is a ${actual}`);
+}
 
 function sameMembers(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
@@ -183,7 +196,7 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
   const hasBlob = async (ref: BlobRef): Promise<boolean> => blobs.get(ref.sha256)?.ref.size === ref.size || (await ctx.blobs.has(ref));
 
   // Git objects: bytes against id, then git's own format check, without writing anything.
-  const gitObjects = new Map<string, { type: GitObjectType; entry: TarEntry; references: string[] }>();
+  const gitObjects = new Map<string, { type: GitObjectType; entry: TarEntry; references: ObjectReference[] }>();
   let batch: GitObject[] = [];
   let batchBytes = 0;
   const checkBatch = async (): Promise<void> => {
@@ -295,35 +308,39 @@ async function verifyBundle(ctx: BundleContext, handle: FileHandle): Promise<Ver
   }
   if (!sameMembers(declaredCheckpoints, manifest.checkpointIds)) throw invalid('checkpoints declared by the ledgers do not match manifest.json checkpointIds');
 
-  // Every object a run's refs reach is in the bundle or already in this repository.
-  const external = new Set<string>();
+  // Every object a run's refs reach is in the bundle or already in this repository, and has the type its
+  // referrer requires: a ref's target is a commit, a commit's tree is a tree and its parents are commits, a
+  // tree entry is a tree or a blob by its mode, and a tag's object has the tag's type. git's format check
+  // does not look at referenced objects, so without this a re-sealed bundle could plant a commit whose tree
+  // is a blob. Such a checkpoint could be neither restored nor exported again. Objects below one that is
+  // already in this repository are that repository's own.
+  const external = new Map<string, Map<GitObjectType, PendingReference>>();
   const runs: VerifiedRun[] = drafts.map((draft) => {
     const reachable = new Set<string>();
-    const seen = new Set<string>();
-    const pending = draft.refs.map(({ sha }) => sha);
+    const pending: PendingReference[] = draft.refs.map(({ ref, sha }) => ({ sha, type: 'commit', from: { ref } }));
     while (pending.length > 0) {
-      const sha = pending.pop()!;
-      if (seen.has(sha)) continue;
-      seen.add(sha);
-      const object = gitObjects.get(sha);
+      const reference = pending.pop()!;
+      const object = gitObjects.get(reference.sha);
       if (object === undefined) {
-        external.add(sha);
-      } else {
-        reachable.add(sha);
-        pending.push(...object.references);
+        const expected = external.get(reference.sha) ?? new Map<GitObjectType, PendingReference>();
+        if (!expected.has(reference.type)) expected.set(reference.type, reference);
+        external.set(reference.sha, expected);
+        continue;
       }
+      if (object.type !== reference.type) throw wrongType(reference, object.type);
+      if (reachable.has(reference.sha)) continue;
+      reachable.add(reference.sha);
+      for (const child of object.references) pending.push({ ...child, from: { sha: reference.sha, type: object.type } });
     }
     return { ...draft, gitObjects: reachable };
   });
-  const present = await ctx.git.inspect([...external]);
-  const missing = [...external].filter((sha) => present.get(sha) == null);
+  const present = await ctx.git.inspect([...external.keys()]);
+  const missing = [...external.keys()].filter((sha) => present.get(sha) == null);
   if (missing.length > 0) throw incomplete(`bundle lacks ${missing.length} git object(s) its refs need (e.g. ${missing[0]}), and this repository does not have them`);
-
-  // Every ref points at a commit, whether the commit travels in the bundle or is already in this repository.
-  for (const run of runs) {
-    for (const { ref, sha } of run.refs) {
-      const type = gitObjects.get(sha)?.type ?? present.get(sha)?.type;
-      if (type !== 'commit') throw invalid(`ref ${ref} does not point at a commit (${sha} is a ${type ?? 'missing object'})`);
+  for (const [sha, expected] of external) {
+    const actual = present.get(sha)!.type;
+    for (const reference of expected.values()) {
+      if (reference.type !== actual) throw wrongType(reference, actual);
     }
   }
 

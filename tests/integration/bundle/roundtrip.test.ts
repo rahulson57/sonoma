@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.setConfig({ testTimeout: 180_000, hookTimeout: 120_000 });
+import { BlobStore } from '../../../src/storage/index.js';
 import { answering, allEvents, checkpoint, event, git, openStore, seedCleanRun, snapshotTree, type Store } from '../../unit/bundle/fixtures.js';
 
 async function checkpointRefs(store: Store): Promise<string> {
@@ -14,6 +15,10 @@ async function checkpointRefs(store: Store): Promise<string> {
 
 async function stateBlobBytes(store: Store, sha: string): Promise<Buffer> {
   return readFile(path.join(store.backend.layout.objects, sha.slice(0, 2), sha));
+}
+
+function blobStore(store: Store): BlobStore {
+  return new BlobStore(store.backend.layout.objects, store.backend.layout.tmp);
 }
 
 describe('bundle round trip', () => {
@@ -34,9 +39,12 @@ describe('bundle round trip', () => {
     const { runId } = await seedCleanRun(source);
     const artifact = await source.backend.putBlob(Buffer.from('coverage: 87 percent\n', 'utf8'));
     await event(source, runId, 'tool.completed', { stdout: 'tests passed', stderr: '', output: artifact });
-    // Over the 1 MB inline limit: stored as payload_ref.
-    const big = await event(source, runId, 'tool.completed', { stdout: 'lorem ipsum dolor sit amet '.repeat(45_000), stderr: '' });
+    // Over the 1 MB inline limit: stored as payload_ref. The second artifact is referenced only from inside
+    // that payload blob.
+    const nestedArtifact = await source.backend.putBlob(Buffer.from('lint: 0 warnings\n', 'utf8'));
+    const big = await event(source, runId, 'tool.completed', { stdout: 'lorem ipsum dolor sit amet '.repeat(45_000), stderr: '', report: nestedArtifact });
     expect(big.payload_ref).not.toBeNull();
+    expect(JSON.stringify(big.payload)).not.toContain(nestedArtifact.sha256);
     await checkpoint(source, runId, 'c_2', { 'README.md': '# demo project\n', 'src/app.ts': 'export const version = 3;\n', 'src/lib/util.ts': 'export {};\n' }, 'third');
 
     const result = await source.service.exportBundle(runId, {}, answering('y'));
@@ -44,7 +52,17 @@ describe('bundle round trip', () => {
     // Verified identifiers are not redaction hits, so a clean run exports unchanged and stays importable.
     expect(result.report.hits).toEqual([]);
 
+    // Import writes only the CAS blobs the run references, so each kind of reference must bring its blob:
+    // the payload blob, an artifact referenced inline, and an artifact referenced only inside the payload blob.
+    const referencedBlobs = [big.payload_ref!, artifact, nestedArtifact];
+    for (const ref of referencedBlobs) expect(await blobStore(destination).has(ref)).toBe(false);
+
     expect(await destination.service.importBundle(result.bundlePath!)).toEqual({ runIds: [runId] });
+
+    for (const ref of referencedBlobs) {
+      expect(await blobStore(destination).has(ref)).toBe(true);
+      expect((await blobStore(destination).read(ref)).equals(await blobStore(source).read(ref))).toBe(true);
+    }
 
     const sourceCheckpoints = await source.backend.listCheckpoints(runId);
     const importedCheckpoints = await destination.backend.listCheckpoints(runId);

@@ -90,27 +90,55 @@ export function decodeGitObject(encoded: Buffer): { type: GitObjectType; content
   return { type: header[1] as GitObjectType, content };
 }
 
-/** Object ids a commit, tree or tag points at (gitlinks excluded: they name another repository's commit). */
-export function referencedObjects(type: GitObjectType, content: Buffer): string[] {
+/** An object another object points at, and the type the pointing object requires it to have. */
+export interface ObjectReference {
+  readonly sha: string;
+  readonly type: GitObjectType;
+}
+
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+const S_IFGITLINK = 0o160000;
+
+/**
+ * Objects a commit, tree or tag points at, each with the type it must have: a commit's tree is a tree
+ * and its parents are commits; a tag's object has the tag's `type`; a tree entry is a tree when its mode
+ * is a directory, and otherwise a blob (git's own rule, object_type(mode)). Gitlinks are excluded,
+ * because they name another repository's commit.
+ *
+ * git's format check (hash-object) does not look at referenced objects, so a caller walking a graph must
+ * compare these types itself.
+ */
+export function referencedObjects(type: GitObjectType, content: Buffer): ObjectReference[] {
   if (type === 'blob') return [];
-  const out: string[] = [];
+  const out: ObjectReference[] = [];
   if (type === 'tree') {
     for (let at = 0; at < content.byteLength; ) {
       const space = content.indexOf(0x20, at);
       const nul = space === -1 ? -1 : content.indexOf(0, space);
       if (space === -1 || nul === -1 || nul + 21 > content.byteLength) throw malformed('git tree object is malformed');
-      if (content.toString('latin1', at, space) !== '160000') out.push(content.toString('hex', nul + 1, nul + 21));
+      const mode = content.toString('latin1', at, space);
+      if (!/^[0-7]{1,6}$/.test(mode)) throw malformed(`git tree entry mode ${JSON.stringify(mode)} is malformed`);
+      const format = Number.parseInt(mode, 8) & S_IFMT;
+      if (format !== S_IFGITLINK) out.push({ sha: content.toString('hex', nul + 1, nul + 21), type: format === S_IFDIR ? 'tree' : 'blob' });
       at = nul + 21;
     }
     return out;
   }
   const headerEnd = content.indexOf('\n\n');
-  const header = content.toString('utf8', 0, headerEnd === -1 ? content.byteLength : headerEnd);
-  for (const line of header.split('\n')) {
-    const match = /^(tree|parent|object) ([0-9a-f]{40})$/.exec(line);
-    if (match) out.push(match[2]!);
+  const lines = content.toString('utf8', 0, headerEnd === -1 ? content.byteLength : headerEnd).split('\n');
+  if (type === 'commit') {
+    for (const line of lines) {
+      const match = /^(tree|parent) ([0-9a-f]{40})$/.exec(line);
+      if (match) out.push({ sha: match[2]!, type: match[1] === 'tree' ? 'tree' : 'commit' });
+    }
+    if (!out.some((ref) => ref.type === 'tree')) throw malformed('git commit object has no tree');
+    return out;
   }
-  if (type === 'commit' && !/^tree [0-9a-f]{40}$/m.test(header)) throw malformed('git commit object has no tree');
+  const object = lines.map((line) => /^object ([0-9a-f]{40})$/.exec(line)).find((match) => match !== null);
+  const target = lines.map((line) => /^type (commit|tree|blob|tag)$/.exec(line)).find((match) => match !== null);
+  if (object == null || target == null) throw malformed('git tag object has no object or type');
+  out.push({ sha: object[1]!, type: target[1] as GitObjectType });
   return out;
 }
 
